@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>monify — scenario-specialized visualizations</title>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body {
+        min-height: 100vh;
+        font: 15px/1.6 ui-sans-serif, system-ui, sans-serif;
+        color: #e8eaf2;
+        background: radial-gradient(1200px 800px at 70% -10%, #1c2740 0%, #0f1116 60%);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 8vh 24px 6vh;
+      }
+      header { max-width: 760px; text-align: center; margin-bottom: 40px; }
+      h1 { font-size: 40px; letter-spacing: -0.5px; margin-bottom: 10px; }
+      h1 span { color: #78b4f0; }
+      header p { opacity: 0.78; font-size: 16px; }
+      .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; max-width: 760px; width: 100%; }
+      a.card {
+        display: block;
+        text-decoration: none;
+        color: inherit;
+        background: rgba(20, 24, 34, 0.75);
+        border: 1px solid rgba(120, 160, 220, 0.22);
+        border-radius: 12px;
+        padding: 22px 22px 20px;
+        transition: transform 0.15s, border-color 0.15s, background 0.15s;
+      }
+      a.card:hover { transform: translateY(-3px); border-color: rgba(120, 160, 220, 0.6); background: rgba(26, 32, 46, 0.9); }
+      .card h2 { font-size: 20px; margin-bottom: 6px; }
+      .card .tag { font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; color: #78b4f0; opacity: 0.9; }
+      .card p { opacity: 0.75; font-size: 14px; margin-top: 8px; }
+      footer { margin-top: 44px; opacity: 0.5; font-size: 13px; text-align: center; max-width: 620px; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>moni<span>fy</span></h1>
+      <p>
+        Scenario-specialized data visualizations on a high-performance WebGL2
+        canvas. Every tool is a polished, consistent concept — mouse + keyboard
+        interaction, smooth zoom that reveals detail or aggregates, and position,
+        color, shape &amp; height all carrying meaning.
+      </p>
+    </header>
+    <div class="cards">
+      <a class="card" href="/demos/treemap/">
+        <div class="tag">recursive · hierarchical</div>
+        <h2>TreeMap →</h2>
+        <p>
+          Zoom into any cell to reveal a nested treemap; zoom out and a whole
+          subtree collapses into one aggregate cell. Live values reflow the
+          layout in real time.
+        </p>
+      </a>
+      <a class="card" href="/demos/hexgrid/">
+        <div class="tag">honeycomb · monitoring</div>
+        <h2>HexGrid →</h2>
+        <p>
+          Hundreds of workloads as hexagonal cells placed by name. Color encodes
+          criticality, anomalies pulse, and zooming into a cell reveals its
+          per-resource sub-hexes.
+        </p>
+      </a>
+    </div>
+    <footer>
+      Built on a vendored semantic-zoom engine. Scroll to zoom, drag to pan,
+      click to fly in.
+    </footer>
+  </body>
+</html>

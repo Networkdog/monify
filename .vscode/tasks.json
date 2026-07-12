@@ -1,0 +1,20 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Start Vite dev server (app config)",
+      "detail": "Serves the multi-page app (index + demos) without auto-opening a browser.",
+      "type": "shell",
+      "command": "node",
+      "args": ["node_modules/vite/bin/vite.js", "--config", "vite.config.app.ts"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "isBackground": true,
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,49 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Run app (Edge)",
+      "program": "${workspaceFolder}/node_modules/vite/bin/vite.js",
+      "args": ["--config", "vite.config.app.ts"],
+      "cwd": "${workspaceFolder}",
+      "env": { "NO_COLOR": "1" },
+      "skipFiles": ["<node_internals>/**"],
+      "serverReadyAction": {
+        "pattern": "Local:\\s+(https?://\\S+)",
+        "uriFormat": "%s",
+        "action": "debugWithEdge",
+        "webRoot": "${workspaceFolder}"
+      }
+    },
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Run app (Chrome)",
+      "program": "${workspaceFolder}/node_modules/vite/bin/vite.js",
+      "args": ["--config", "vite.config.app.ts"],
+      "cwd": "${workspaceFolder}",
+      "env": { "NO_COLOR": "1" },
+      "skipFiles": ["<node_internals>/**"],
+      "serverReadyAction": {
+        "pattern": "Local:\\s+(https?://\\S+)",
+        "uriFormat": "%s",
+        "action": "debugWithChrome",
+        "webRoot": "${workspaceFolder}"
+      }
+    },
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Debug tests (Vitest)",
+      "program": "${workspaceFolder}/node_modules/vitest/vitest.mjs",
+      "args": ["run"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "autoAttachChildProcesses": true,
+      "smartStep": true,
+      "skipFiles": ["<node_internals>/**", "**/node_modules/**"]
+    }
+  ]
+}
