@@ -101,6 +101,9 @@ const HEIGHT_PULSE = 0.75;
 // the inter-workload gap as a fraction of the hex radius.
 const WORKLOAD_ALPHA = 0.68;
 const GAP_FRAC = 0.08;
+// Fraction of its radius each sub-layer cell is drawn at, leaving a gap between
+// adjacent cells. Reused as the coarser-layer core radius when nesting gaps.
+const SUB_FILL = 0.94;
 const HOT: RGBA = [1, 0.96, 0.75, 1];
 const SQRT3 = Math.sqrt(3);
 
@@ -126,6 +129,21 @@ function pointInRings(x: number, y: number, rings: number[][]): boolean {
     }
   }
   return inside;
+}
+
+/**
+ * Exact containment test for a pointy-top regular hexagon of circumradius `R`
+ * centred at the origin: the hexagon is the intersection of three edge slabs
+ * (normals at 0°/60°/120°), each of half-width = inradius = R·√3/2. Used to
+ * detect a coarser sub-layer's inter-cell gap when nesting the honeycomb gaps.
+ */
+function inHexCore(dx: number, dy: number, R: number): boolean {
+  const k = R * 0.8660254037844386; // inradius = R·√3/2
+  return (
+    Math.abs(dx) <= k &&
+    Math.abs(0.5 * dx + 0.8660254037844386 * dy) <= k &&
+    Math.abs(-0.5 * dx + 0.8660254037844386 * dy) <= k
+  );
 }
 
 /** Small deterministic hash of a sub-cell (q, r, layer) → uint32. */
@@ -566,7 +584,7 @@ export class HexGrid extends VizBase {
     const qMin = Math.floor((ox - 0.5) * invCol - rMax / 2) - 1;
     const qMax = Math.ceil((x1 - 0.5) * invCol - rMin / 2) + 1;
 
-    const fillR = cellR * 0.94;
+    const fillR = cellR * SUB_FILL;
     for (let r = rMin; r <= rMax; r++) {
       for (let q = qMin; q <= qMax; q++) {
         const wx = 0.5 + SQRT3 * cellR * (q + r / 2);
@@ -581,6 +599,11 @@ export class HexGrid extends VizBase {
         // deep-zoom fill keeps exactly the same silhouette — and the same gaps —
         // as the layer-0 honeycomb.
         if (!pointInRings(wx, wy, host.outline)) continue;
+        // Nest the gap across layers: also omit this fine cell if its centre
+        // falls in a COARSER sub-layer's inter-cell gap, so the honeycomb keeps
+        // visible gaps at every scale (self-similar) as you zoom deeper — the
+        // same gap treatment layer 0 gets, applied to each intermediate layer.
+        if (this.inNestedGap(wx, wy, layer)) continue;
         out.push({
           type: 'vector',
           rings: [hexPolygon(wx, wy, fillR)],
@@ -590,6 +613,24 @@ export class HexGrid extends VizBase {
         });
       }
     }
+  }
+
+  /**
+   * True if (wx, wy) falls in the inter-cell gap of any sub-layer COARSER than
+   * `layer` (1 .. layer-1). Each coarser layer draws its cells at SUB_FILL of
+   * their radius, so the gap is everything outside the containing coarser
+   * cell's SUB_FILL core. Testing every coarser layer makes the honeycomb gaps
+   * nest self-similarly, so they stay visible at every zoom depth.
+   */
+  private inNestedGap(wx: number, wy: number, layer: number): boolean {
+    for (let k = 1; k < layer; k++) {
+      const kR = this.worldHexRadius / Math.pow(LAYER_SUBDIV, k);
+      const [kfq, kfr] = pixelToAxial(wx - 0.5, wy - 0.5, kR);
+      const [kq, kr] = hexRound(kfq, kfr);
+      const [kpx, kpy] = axialToPixel(kq, kr, kR);
+      if (!inHexCore(wx - 0.5 - kpx, wy - 0.5 - kpy, SUB_FILL * kR)) return true;
+    }
+    return false;
   }
 
   /**
