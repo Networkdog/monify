@@ -93,6 +93,9 @@ export class Scene {
   private viewH = 0;
   private dpr = 1;
   private viewMat = new Float32Array(16);
+  /** Camera height above the ground plane (world units) from the last
+   *  buildMVP — used to sort translucent prisms by true camera distance. */
+  private camHeight = 1;
   private _dirty = true;
 
   // --- Per-frame cache: avoids redundant zoomLayers / visibleTiles between
@@ -311,6 +314,9 @@ export class Scene {
     const aspect = this.viewW / this.viewH;
     // Camera height so that ground coverage matches the 2D view.
     const h = this.viewH / (2 * s * tanHalf);
+    // Remember it so translucent prisms can be depth-sorted by true camera
+    // distance (see drawTileLayer / prismCamDist2).
+    this.camHeight = h;
     const near = h * 0.1;
     const far = h * 2.0;
     const nf = far - near;
@@ -613,13 +619,19 @@ export class Scene {
       }
     }
 
-    // Tessellate the translucent prisms sorted far -> near. The camera looks
-    // straight down, so clip-space depth depends ONLY on a fragment's height
-    // (buildMVP puts no x/y term in clip z or w) -- height IS the exact view
-    // depth. Emitting shortest (farthest) -> tallest (nearest) makes a nearer
-    // prism paint over a farther one; without this, depth-writes being off
-    // (for translucency) would let a later-drawn back prism cover a front one.
-    prisms.sort((a, b) => a.height - b.height);
+    // Tessellate the translucent prisms sorted far -> near. Depth-WRITES are
+    // off so the faces blend, which means DRAW ORDER — not the depth buffer —
+    // decides which prism paints over which. Under this perspective camera
+    // (hovering at camHeight straight above the scene) a prism's on-screen
+    // occlusion depends on its full 3D distance from the camera, NOT on its
+    // height alone: a tall prism far to the back (high on screen) must not
+    // paint over a short prism up front. So rank each prism by the squared
+    // camera distance of its top-centre and emit farthest -> nearest, letting
+    // nearer prisms correctly overwrite farther ones.
+    const camH = this.camHeight;
+    prisms.sort(
+      (a, b) => prismCamDist2(b, camH, cx, cy) - prismCamDist2(a, camH, cx, cy),
+    );
     for (const el of prisms) {
       for (const ring of el.rings) {
         const n = ring.length >> 1;
@@ -945,8 +957,37 @@ let SCRATCH_CYL = new Float32Array(COLORED_STRIDE * 256);
 let SCRATCH_HEX = new Float32Array(COLORED_STRIDE * 512);
 let SCRATCH_VECTOR = new Float32Array(VECTOR_STRIDE * 4096);
 let SCRATCH_MESH = new Float32Array(MESH_STRIDE * 4096);
+/**
+ * Squared distance from the camera to a prism's top-centre, in camera-relative
+ * space where the camera sits at (0, 0, camH) directly above the scene. Used to
+ * sort the translucent prisms back-to-front: because depth-writes are off (so
+ * the faces blend), draw order alone decides occlusion, and under perspective a
+ * prism's on-screen depth is its full 3D camera distance — not its height.
+ */
+function prismCamDist2(
+  el: FlatElement & { type: 'extruded' },
+  camH: number,
+  cx: number,
+  cy: number,
+): number {
+  const ring = el.rings[0];
+  if (!ring) return camH * camH;
+  const n = ring.length >> 1;
+  let mx = 0;
+  let my = 0;
+  for (let i = 0; i < n; i++) {
+    mx += ring[i * 2];
+    my += ring[i * 2 + 1];
+  }
+  mx = mx / n - cx;
+  my = my / n - cy;
+  const dz = camH - el.height;
+  return mx * mx + my * my + dz * dz;
+}
+
 // Reused per layer: extruded prisms collected during the tile loop so they can
-// be sorted back-to-front (by height) before tessellation (see drawTileLayer).
+// be sorted back-to-front (by camera distance) before tessellation, so nearer
+// prisms paint over farther ones (see drawTileLayer).
 const SCRATCH_PRISMS: (FlatElement & { type: 'extruded' })[] = [];
 
 // Pooled textured batch map. Cleared by resetting counts (not by deleting

@@ -12,6 +12,7 @@ export default defineConfig({
     rollupOptions: {
       input: {
         main: resolve(__dirname, 'index.html'),
+        estate: resolve(__dirname, 'demos/estate/index.html'),
         treemap: resolve(__dirname, 'demos/treemap/index.html'),
         hexgrid: resolve(__dirname, 'demos/hexgrid/index.html'),
       },

@@ -20,4 +20,11 @@ export {
   axialKey,
   type Axial,
 } from './hex';
-export { HexPlacer, hashString, type PlacedWorkload } from './placement';
+export {
+  HexPlacer,
+  placeHierarchical,
+  hashString,
+  type PlacedWorkload,
+  type GroupedItem,
+  type HierItem,
+} from './placement';

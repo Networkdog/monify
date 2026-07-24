@@ -4,3 +4,8 @@ coverage/
 *.local
 .DS_Store
 *.tsbuildinfo
+
+# Local browser capture / screenshot artifacts (verification only, never committed)
+.captures/*
+!.captures/.gitkeep
+.playwright-mcp/
