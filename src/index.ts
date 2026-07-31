@@ -68,3 +68,6 @@ export * from './color';
 
 // ── Visualizations ───────────────────────────────────────────────────────────
 export * from './viz';
+
+// ── Live data pipeline (source-agnostic monitoring feed) ─────────────────────
+export * from './data';

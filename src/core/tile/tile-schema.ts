@@ -98,6 +98,14 @@ export interface VectorElement extends BaseElement {
   fill?: RGBA;
   stroke?: RGBA;
   strokeWidth?: number;
+  /**
+   * Renderer cache: the fill triangulated ONCE into a world-space triangle soup
+   * ([x0,y0,x1,y1,...]). Filled lazily by the scene on first draw, or supplied
+   * pre-baked (e.g. by the zoom-out aggregates) so the O(n²) ear-clip never runs
+   * per frame. Drawing only shifts by the camera + applies `fill`. Recolouring in
+   * place (mutating `fill`) is free; changing `rings` requires clearing this.
+   */
+  fillTris?: Float32Array;
 }
 
 export interface ExtrudedElement extends BaseElement {

@@ -8,7 +8,7 @@ export {
   MESH_STRIDE,
   fillVertexCount,
   strokeVertexCount,
-  tessellateFillRing,
+  buildFillTris,
   tessellateStroke,
 } from './quad-renderer';
 export { TextureCache, bucketTextSize, type TextureEntry } from './texture-cache';

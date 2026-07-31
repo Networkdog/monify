@@ -1,12 +1,15 @@
 // Estate Monitor — a whole Azure estate as a honeycomb of monitored resources.
 //
-// ~50,000 monitored resources (VM, SQL DB, App Service, Key Vault, Firewall, …)
-// each render as a single hex cell, laid out with *locality*: cells that share a
-// grouping criterion sit next to each other. The estate models an Azure landing
-// zone on Virtual WAN — 10 secured hubs (Azure Firewall), ~1,000 Prod/Dev
-// subscriptions (a VNet spoke each), 500 workloads. Placement nests by network
-// topology (hub › subscription › resource group), so each hub is a territory and
-// its spoke subscriptions cluster inside it.
+// Every cell is a resource that Azure Resource Health actually reports on (VM,
+// SQL DB, App Service, Key Vault, Firewall, …); pure config/policy resources
+// with no health concept (VNet, NSG, Public IP, Private Endpoint, NIC, route
+// table, firewall policy, App Insights) are left off the wall. Each cell renders
+// as a single hex, laid out with *locality*: cells that share a grouping
+// criterion sit next to each other. The estate models an Azure landing zone on
+// Virtual WAN — 10 secured hubs (Azure Firewall), ~1,000 Prod/Dev subscriptions
+// (a VNet spoke each), 500 workloads. Placement nests by network topology
+// (hub › subscription › resource group), so each hub is a territory and its
+// spoke subscriptions cluster inside it.
 //
 // The in-cell glyph is the resource-type code (its "icon"). Colour is driven by
 // a chosen criterion — Health (live RdYlGn) or a structural dimension (hub /
@@ -18,7 +21,8 @@
 import { HexGrid, type WorkloadInput } from '../viz/hexgrid';
 import { paletteStops } from '../color';
 import type { RGBA } from '../core/types';
-import { mulberry32, randRange, randInt, pick } from './random';
+import { mulberry32, randRange, randInt } from './random';
+import { SimulatedSource, MonitorFeed, type SimEntity } from '../data';
 
 // ── Estate catalogs ──────────────────────────────────────────────────────────
 
@@ -50,6 +54,12 @@ interface RType {
   name: string;
   kind: string;
 }
+// Only resource types that Azure Resource Health actually reports on live on the
+// wall — this is a health-monitoring estate, so resources with no health concept
+// (pure config/policy: Virtual Network, NSG, Public IP, Private Endpoint, NIC,
+// Route Table, Firewall Policy) and resources Resource Health doesn't surface
+// (App Insights) are intentionally excluded.
+// See: https://learn.microsoft.com/azure/service-health/resource-health-checks-resource-types
 const RTYPES: Record<string, RType> = {
   VM: { code: 'VM', name: 'Virtual Machine', kind: 'compute' },
   VMSS: { code: 'VMSS', name: 'VM Scale Set', kind: 'compute' },
@@ -65,18 +75,10 @@ const RTYPES: Record<string, RType> = {
   EH: { code: 'EH', name: 'Event Hub', kind: 'integration' },
   KV: { code: 'KV', name: 'Key Vault', kind: 'security' },
   LAW: { code: 'LAW', name: 'Log Analytics', kind: 'monitor' },
-  AI: { code: 'AI', name: 'App Insights', kind: 'monitor' },
-  VNET: { code: 'VNET', name: 'Virtual Network (spoke)', kind: 'network' },
-  NSG: { code: 'NSG', name: 'Network Security Group', kind: 'network' },
-  PIP: { code: 'PIP', name: 'Public IP', kind: 'network' },
   LB: { code: 'LB', name: 'Load Balancer', kind: 'network' },
   AGW: { code: 'AGW', name: 'Application Gateway', kind: 'network' },
-  PE: { code: 'PE', name: 'Private Endpoint', kind: 'network' },
-  NIC: { code: 'NIC', name: 'Network Interface', kind: 'network' },
-  RT: { code: 'RT', name: 'Route Table', kind: 'network' },
   VHUB: { code: 'VHUB', name: 'Virtual WAN Hub', kind: 'connectivity' },
   FW: { code: 'FW', name: 'Azure Firewall', kind: 'connectivity' },
-  FWP: { code: 'FWP', name: 'Firewall Policy', kind: 'connectivity' },
   VPN: { code: 'VPN', name: 'VPN Gateway', kind: 'connectivity' },
   ER: { code: 'ER', name: 'ExpressRoute Gateway', kind: 'connectivity' },
 };
@@ -115,7 +117,8 @@ interface SubCtx {
 }
 
 /** Build the estate: 10 vWAN hubs › ~1,010 subscriptions (Prod/Dev + connectivity) › RGs ›
- *  ~47k resources, with per-workload size varying widely (a few workloads sprawl past 3×). */
+ *  health-reported resources. Per-workload size: 95% of workloads sit near ~50 resources,
+ *  while a rare 5% vary widely, spreading from 50 up to 300. */
 function buildEstate(rng: () => number): Target[] {
   const targets: Target[] = [];
   let seq = 0;
@@ -158,15 +161,16 @@ function buildEstate(rng: () => number): Target[] {
     }
   };
 
-  // Per-workload resource multiplier: a long-tailed mix so most workloads are
-  // modest spokes while a few sprawl past 3× the typical size — a livelier estate
-  // (kept in check so the sprawling blobs don't blow up placement time).
+  // Per-workload resource multiplier. Most workloads (95%) stay near the ~50
+  // baseline; only a rare 5% vary widely, spreading anywhere from 50 up to 300
+  // resources. Baseline (scale 1) is ~56 resources per workload (its prod + dev
+  // subs), so a target of T resources ⇒ scale = T/56.
+  const WORKLOAD_BASE = 56;
   const workloadScale = (): number => {
-    const u = rng();
-    if (u < 0.55) return randRange(rng, 0.4, 0.8); // small spoke
-    if (u < 0.86) return randRange(rng, 0.8, 1.3); // typical
-    if (u < 0.97) return randRange(rng, 1.5, 2.4); // large
-    return randRange(rng, 2.8, 3.6); // sprawling (3×+)
+    const t = rng() < 0.95
+      ? 50 // the 95%: ~50 resources (only the baseline's own spread varies them)
+      : 50 + 250 * rng(); // the rare 5%: spread widely across 50–300
+    return t / WORKLOAD_BASE;
   };
 
   // 500 workloads; workload i is homed in hub i % HUBS.length (its prod & dev subs together).
@@ -189,10 +193,8 @@ function buildEstate(rng: () => number): Target[] {
     const connRg = `rg-connectivity-${hub.region}`;
     emit(conn, connRg, 'VHUB');
     emit(conn, connRg, 'FW');
-    emit(conn, connRg, 'FWP');
     emit(conn, connRg, 'VPN');
     emit(conn, connRg, 'ER');
-    gen(conn, connRg, [['PIP', 2, 4], ['RT', 3, 6], ['NSG', 1, 3]]);
     gen(conn, `rg-platform-mgmt-${hub.region}`, [['LAW', 1, 2], ['STG', 1, 3], ['KV', 1, 2], ['VM', 1, 3]]);
 
     // Workload subscriptions homed in this hub — prod first, then dev. Each
@@ -206,14 +208,15 @@ function buildEstate(rng: () => number): Target[] {
       for (const wl of hubWorkloads) {
         const scale = scaleOf.get(wl) ?? 1;
         const ctx: SubCtx = { mg, sub: `sub-${wl}-${env}`, workload: wl, hub: hub.id, region: hub.region, env };
-        // Spoke network: one VNet per subscription, plus its (scaled) resources.
+        // Spoke network: the load balancer is the only network resource with a
+        // health concept — the VNet/NSG/PIP/PE/NIC/route-table config resources
+        // are excluded because Resource Health doesn't report on them.
         const netRg = `rg-${wl}-${env}-net`;
-        emit(ctx, netRg, 'VNET');
-        gen(ctx, netRg, [['NSG', 2, 4], ['PIP', 1, 3], ['LB', 0, 2], ['PE', 3, 8], ['NIC', 3, 7], ['RT', 1, 2]], scale);
+        gen(ctx, netRg, [['LB', 0, 2]], scale);
         gen(ctx, `rg-${wl}-${env}-web`, [['APP', 2, 6], ['FN', 1, 4], ['AGW', 0, 2]], scale);
-        gen(ctx, `rg-${wl}-${env}-app`, [['VM', 2, 7], ['VMSS', 0, 2], ['AKS', 0, 2], ['NIC', 1, 4]], scale);
+        gen(ctx, `rg-${wl}-${env}-app`, [['VM', 2, 7], ['VMSS', 0, 2], ['AKS', 0, 2]], scale);
         gen(ctx, `rg-${wl}-${env}-data`, [['SQL', 1, 3], ['COS', 0, 2], ['PG', 0, 2], ['RDS', 0, 2], ['STG', 1, 3]], scale);
-        gen(ctx, `rg-${wl}-${env}-shared`, [['KV', 1, 2], ['STG', 1, 2], ['LAW', 0, 1], ['AI', 1, 3]], scale);
+        gen(ctx, `rg-${wl}-${env}-shared`, [['KV', 1, 2], ['STG', 1, 2], ['LAW', 0, 1]], scale);
         // Larger workloads are likelier to run a messaging tier.
         if (rng() < Math.min(0.95, 0.5 + 0.15 * scale)) {
           gen(ctx, `rg-${wl}-${env}-integration`, [['SB', 1, 3], ['EH', 0, 3]], scale);
@@ -279,17 +282,6 @@ function buildColoring(targets: Target[], keyOf: (t: Target) => string): DimColo
   const tints = targets.map((t) => color.get(keyOf(t)) ?? NEUTRAL_TINT);
   const legend = entries.map(([k, count]) => ({ key: k, color: color.get(k) ?? NEUTRAL_TINT, count }));
   return { tints, legend };
-}
-
-// ── Live simulation ──────────────────────────────────────────────────────────
-
-interface Sim {
-  name: string;
-  base: number;
-  crit: number;
-  elevated: number; // ticks remaining
-  mean: number;
-  metrics: { id: string; base: number; sev: number }[];
 }
 
 // ── UI ───────────────────────────────────────────────────────────────────────
@@ -385,8 +377,9 @@ function main(): void {
   const AFFINITY_WEIGHTS = [1.1, 1.3, 0]; // hub · workload · subscription (workload = the base cluster)
 
   // How "shared" each resource kind is → higher values sit nearer the centre of
-  // their cluster. Connectivity (vWAN hub, firewall) is the most shared, then the
-  // spoke network; compute/web/data are workload-specific leaves at the edges.
+  // their cluster. Connectivity (vWAN hub, firewall) is the most shared; the
+  // network ingress (load balancer, app gateway) is shared across a workload's
+  // backends; compute/web/data are workload-specific leaves at the edges.
   const CENTRALITY: Record<string, number> = {
     connectivity: 1.0,
     network: 0.8,
@@ -420,98 +413,27 @@ function main(): void {
     resources: t.metrics.map((m) => ({ id: m.id, value: m.base })),
   }));
 
-  // Simulation state (built once; reset on each re-mount).
-  const sims: Sim[] = targets.map((t) => ({
-    name: t.name,
-    base: t.base,
-    crit: t.base,
-    elevated: 0,
-    mean: t.base,
-    metrics: t.metrics.map((m) => ({ id: m.id, base: m.base, sev: m.base })),
+  // Live data pipeline: a SimulatedSource stands in for a real monitoring
+  // backend (Azure Monitor, Prometheus, a WebSocket feed…), streaming batches of
+  // correlated incidents that a MonitorFeed routes into the grid. Its group
+  // levels [hub, subscription, resource group] reproduce the estate's
+  // blast-radius correlation (coarse groups rarer but wider), so dropping in a
+  // WebSocketSource later needs no change to the visualization.
+  const simEntities: SimEntity[] = targets.map((t) => ({
+    id: t.name,
+    baseline: t.base,
+    groups: [t.hub, t.sub, t.rg],
+    resources: t.metrics.map((m) => m.id),
   }));
-  const byRg = new Map<string, number[]>();
-  const bySub = new Map<string, number[]>();
-  const byHub = new Map<string, number[]>();
-  const push = (map: Map<string, number[]>, key: string, i: number): void => {
-    const arr = map.get(key);
-    if (arr) arr.push(i);
-    else map.set(key, [i]);
-  };
-  targets.forEach((t, i) => {
-    push(byRg, t.rg, i);
-    push(bySub, t.sub, i);
-    push(byHub, t.hub, i);
-  });
-  const rgKeys = [...byRg.keys()];
-  const subKeys = [...bySub.keys()];
-  const hubKeys = [...byHub.keys()];
-  const active = new Set<number>();
-  const membersOf = (map: Map<string, number[]>, key: string): number[] => map.get(key) ?? [];
 
-  // The live grid + timers are rebuilt whenever the spacing (gap) changes.
+  // Latest severity per entity, tracked off the same stream for the HUD counts.
+  const severity = new Map<string, number>();
+
   let grid: HexGrid | null = null;
-  let simTimer = 0;
+  let source: SimulatedSource | null = null;
+  let feed: MonitorFeed | null = null;
   let hudTimer = 0;
   let colorBy = 'health';
-
-  function elevate(i: number, ticks: number, mean: number): void {
-    const s = sims[i];
-    s.elevated = Math.max(s.elevated, ticks);
-    s.mean = Math.max(s.mean, mean);
-    active.add(i);
-    grid?.triggerAnomaly(s.name, Math.min(1, mean));
-    for (let k = 0; k < 2 && s.metrics.length; k++) pick(rng, s.metrics).sev = randRange(rng, 0.6, 1);
-  }
-  function elevateGroup(members: number[], frac: number, ticks: number, mean: number): void {
-    for (const i of members) if (rng() < frac) elevate(i, ticks, mean);
-  }
-
-  function resetSim(): void {
-    active.clear();
-    for (const s of sims) {
-      s.crit = s.base;
-      s.elevated = 0;
-      s.mean = s.base;
-      for (const m of s.metrics) m.sev = m.base;
-    }
-    // Seed a few incidents so the estate isn't uniformly green on load.
-    for (let k = 0; k < 3; k++) {
-      elevateGroup(membersOf(byRg, pick(rng, rgKeys)), 0.8, randInt(rng, 14, 26), randRange(rng, 0.75, 0.95));
-    }
-  }
-
-  // One simulation step: spawn correlated incidents (wider = rarer), then drift
-  // only the active (elevated/recovering) targets so healthy cells stay cheap.
-  function tick(): void {
-    const g = grid;
-    if (!g) return;
-    for (let k = 0; k < randInt(rng, 0, 4); k++) elevate(randInt(rng, 0, sims.length - 1), randInt(rng, 8, 20), randRange(rng, 0.7, 0.95));
-    if (rng() < 0.3) elevateGroup(membersOf(byRg, pick(rng, rgKeys)), randRange(rng, 0.5, 0.9), randInt(rng, 12, 24), randRange(rng, 0.75, 0.96));
-    if (rng() < 0.1) elevateGroup(membersOf(bySub, pick(rng, subKeys)), randRange(rng, 0.15, 0.3), randInt(rng, 16, 30), randRange(rng, 0.7, 0.92));
-    if (rng() < 0.02) elevateGroup(membersOf(byHub, pick(rng, hubKeys)), randRange(rng, 0.03, 0.07), randInt(rng, 20, 36), randRange(rng, 0.72, 0.9));
-    for (const i of [...active]) {
-      const s = sims[i];
-      const rising = s.elevated > 0;
-      const mean = rising ? s.mean : s.base;
-      const prev = s.crit;
-      s.crit = drift(s.crit, mean, rising ? 0.18 : 0.12, 0.05);
-      if (rising) {
-        s.elevated--;
-        if (s.elevated <= 0) s.mean = s.base;
-        if (rng() < 0.2) g.triggerAnomaly(s.name, 0.7);
-      }
-      g.setCriticality(s.name, s.crit);
-      for (const m of s.metrics) {
-        m.sev = drift(m.sev, rising ? Math.max(m.base, 0.5) : m.base, 0.1, 0.05);
-        g.setResource(s.name, m.id, m.sev);
-      }
-      if (!rising && Math.abs(s.crit - s.base) < 0.01 && Math.abs(prev - s.base) < 0.02) {
-        s.crit = s.base;
-        g.setCriticality(s.name, s.base);
-        active.delete(i);
-      }
-    }
-  }
 
   function applyColorBy(id: string): void {
     colorBy = id;
@@ -535,26 +457,27 @@ function main(): void {
     if (!g) return;
     let critical = 0;
     let warning = 0;
-    for (const s of sims) {
-      if (s.crit > 0.75) critical++;
-      else if (s.crit > 0.4) warning++;
+    let incidents = 0;
+    for (const v of severity.values()) {
+      if (v > 0.75) critical++;
+      else if (v > 0.4) warning++;
+      if (v > 0.3) incidents++;
     }
     const dim = DIMS.find((d) => d.id === colorBy) ?? DIMS[0];
     hud.innerHTML =
-      `<b>${g.fps} fps</b> · ${sims.length.toLocaleString()} resources · ` +
+      `<b>${g.fps} fps</b> · ${targets.length.toLocaleString()} resources · ` +
       `<span class="crit">${critical} critical</span> · <span class="warn">${warning} warning</span> · ` +
-      `${active.size} incidents<br>` +
+      `${incidents} incidents<br>` +
       `색상: ${dim.label} · zoom ${g.scene.camera.zoom.toFixed(1)}`;
   }
 
   // Build the affinity ('All') grid and reset the sim. Each input's groupPath
   // (set above) drives the force-directed placement + zoom-out aggregation.
   function mount(): void {
-    if (simTimer) clearInterval(simTimer);
     if (hudTimer) clearInterval(hudTimer);
+    feed?.stop();
+    source?.stop();
     grid?.destroy();
-    grid = null;
-    resetSim();
     grid = new HexGrid(canvas, {
       workloads: inputs,
       placement: 'affinity',
@@ -563,20 +486,23 @@ function main(): void {
       tweenRate: 4,
     });
     applyColorBy(colorBy);
-    simTimer = window.setInterval(tick, 650);
+
+    // Wire the live feed into the freshly-built grid. Swapping SimulatedSource
+    // for a WebSocketSource (or any DataSource) is the only change needed to
+    // drive this exact wall from a real monitoring backend.
+    severity.clear();
+    source = new SimulatedSource({ entities: simEntities, seed: 1337 });
+    source.onData((records) => {
+      for (const r of records) if (r.severity !== undefined) severity.set(r.id, r.severity);
+    });
+    feed = new MonitorFeed({ source, target: grid });
+    feed.start();
+
     hudTimer = window.setInterval(updateHud, 250);
   }
 
   const setActiveColor = renderSegmented(controls, DIMS, applyColorBy);
   mount();
-}
-
-/** Bounded mean-reverting step (local wrapper so callers stay terse). */
-function drift(value: number, mean: number, reversion: number, volatility: number): number {
-  const pull = (mean - value) * reversion;
-  const shock = (Math.random() * 2 - 1) * volatility;
-  const next = value + pull + shock;
-  return next < 0 ? 0 : next > 1 ? 1 : next;
 }
 
 main();

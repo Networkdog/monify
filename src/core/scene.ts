@@ -8,9 +8,8 @@ import {
   TEXTURED_STRIDE,
   VECTOR_STRIDE,
   MESH_STRIDE,
-  fillVertexCount,
   strokeVertexCount,
-  tessellateFillRing,
+  buildFillTris,
   tessellateStroke,
   bucketTextSize,
   TextureCache,
@@ -407,6 +406,17 @@ export class Scene {
         SCRATCH_HEX = hexArr;
       }
     };
+    let flatHexCount = 0;
+    let flatHexArr = SCRATCH_FLATHEX;
+    const ensureFlatHex = (n: number) => {
+      const need = (flatHexCount + n) * COLORED_STRIDE;
+      if (flatHexArr.length < need) {
+        const next = new Float32Array(Math.max(need, flatHexArr.length * 2));
+        next.set(flatHexArr);
+        flatHexArr = next;
+        SCRATCH_FLATHEX = flatHexArr;
+      }
+    };
     let vectorOffset = 0; // offset in floats into vectorArr
     let vectorArr = SCRATCH_VECTOR;
     const ensureVector = (floats: number) => {
@@ -482,18 +492,35 @@ export class Scene {
           const isHex = el.shape === 'hexagon';
           const has3D = (el.height ?? 0) > 0;
           if (isHex) {
-            // Hexagons always use the hex-prism geometry; at height=0 the FS
-            // discards the side faces, leaving just the flat top hexagon.
-            if (el.stroke && el.strokeWidth) {
-              ensureHex(2);
-              this.writeStroke(hexArr, hexCount, el as ShapeElement, cx, cy);
-              hexCount++;
-              this.writeColored(hexArr, hexCount, el, cx, cy);
-              hexCount++;
+            if (has3D) {
+              // 3D hexagon: full extruded prism (flat top + lit side walls).
+              if (el.stroke && el.strokeWidth) {
+                ensureHex(2);
+                this.writeStroke(hexArr, hexCount, el as ShapeElement, cx, cy);
+                hexCount++;
+                this.writeColored(hexArr, hexCount, el, cx, cy);
+                hexCount++;
+              } else {
+                ensureHex(1);
+                this.writeColored(hexArr, hexCount, el, cx, cy);
+                hexCount++;
+              }
             } else {
-              ensureHex(1);
-              this.writeColored(hexArr, hexCount, el, cx, cy);
-              hexCount++;
+              // Flat hexagon (height=0): draw only the top-face fan. A collapsed
+              // prism would render identically but pay for 24 assembled
+              // triangles per cell (discarded walls + culled bottom); the fan is
+              // 6, which is what keeps a 50k-cell honeycomb cheap.
+              if (el.stroke && el.strokeWidth) {
+                ensureFlatHex(2);
+                this.writeStroke(flatHexArr, flatHexCount, el as ShapeElement, cx, cy);
+                flatHexCount++;
+                this.writeColored(flatHexArr, flatHexCount, el, cx, cy);
+                flatHexCount++;
+              } else {
+                ensureFlatHex(1);
+                this.writeColored(flatHexArr, flatHexCount, el, cx, cy);
+                flatHexCount++;
+              }
             }
           } else if (has3D) {
             // 3D path: box for rects, cylinder for circles
@@ -588,16 +615,29 @@ export class Scene {
           pushTextured(tex.texture, [tx, ty, worldW, worldH], [1, 1, 1, 1], [0, 0, 1, 1], el.elevation ?? 0);
           }
         } else if (el.type === 'vector') {
-          // Fill pass: ear-clip each ring into triangles.
+          // Fill pass: reuse a cached triangle soup (world-space positions), so
+          // the O(n²) ear-clip runs ONCE per element (lazily on first draw, or
+          // supplied pre-baked). Per frame we only subtract the camera centre
+          // and write the (possibly live-updated) colour — cheap even for the
+          // thousands of cluster polygons drawn at the zoomed-out aggregates.
           if (el.fill) {
-            const [fr, fg, fb, fa] = el.fill;
-            for (const ring of el.rings) {
-              const n = ring.length >> 1;
-              const verts = fillVertexCount(n);
-              if (verts > 0) {
-                ensureVector(verts * VECTOR_STRIDE);
-                vectorOffset = tessellateFillRing(ring, vectorArr, vectorOffset, cx, cy, fr, fg, fb, fa);
+            let tris = el.fillTris;
+            if (!tris) tris = el.fillTris = buildFillTris(el.rings);
+            const nv = tris.length >> 1;
+            if (nv > 0) {
+              ensureVector(nv * VECTOR_STRIDE);
+              const [fr, fg, fb, fa] = el.fill;
+              let o = vectorOffset;
+              for (let i = 0; i < nv; i++) {
+                vectorArr[o] = tris[i * 2] - cx;
+                vectorArr[o + 1] = tris[i * 2 + 1] - cy;
+                vectorArr[o + 2] = fr;
+                vectorArr[o + 3] = fg;
+                vectorArr[o + 4] = fb;
+                vectorArr[o + 5] = fa;
+                o += VECTOR_STRIDE;
               }
+              vectorOffset = o;
             }
           }
           // Stroke pass: tessellate each ring as a ribbon of quads.
@@ -654,6 +694,9 @@ export class Scene {
     }
     if (hexCount > 0) {
       this.renderer.drawHexPrisms(hexArr, hexCount);
+    }
+    if (flatHexCount > 0) {
+      this.renderer.drawFlatHex(flatHexArr, flatHexCount);
     }
     // Extruded polygon meshes (workload prisms): 3D and depth-TESTED, but with
     // depth-WRITES and back-face culling OFF, so the translucent faces actually
@@ -955,6 +998,7 @@ let SCRATCH_FLAT = new Float32Array(COLORED_STRIDE * 2048);
 let SCRATCH_BOX = new Float32Array(COLORED_STRIDE * 256);
 let SCRATCH_CYL = new Float32Array(COLORED_STRIDE * 256);
 let SCRATCH_HEX = new Float32Array(COLORED_STRIDE * 512);
+let SCRATCH_FLATHEX = new Float32Array(COLORED_STRIDE * 2048);
 let SCRATCH_VECTOR = new Float32Array(VECTOR_STRIDE * 4096);
 let SCRATCH_MESH = new Float32Array(MESH_STRIDE * 4096);
 /**

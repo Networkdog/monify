@@ -309,6 +309,37 @@ const CYL = buildPrism(CYL_N);
 // Pointy-top hexagonal prism (a vertex at the top, matching hexPolygon()).
 const HEX = buildPrism(6, -Math.PI / 2);
 
+// Flat pointy-top hexagon — just the prism's top face as a 6-triangle fan at
+// z=0 (18 indices vs the prism's 72). A height=0 hexagon collapses the prism to
+// this exact silhouette anyway, but still pays for 24 assembled triangles (12
+// discarded side walls + a culled bottom) per instance; drawing the top face
+// alone renders identically while cutting the per-cell triangle count 4×, which
+// matters when tens of thousands of flat hex cells fill the overview.
+function buildFlatHexTop(): { verts: Float32Array; idx: Uint16Array; idxCount: number } {
+  const N = 6;
+  const angleOffset = -Math.PI / 2;
+  const verts = new Float32Array((N + 1) * 6);
+  const idx = new Uint16Array(N * 3);
+  let vi = 0, ii = 0;
+  // Centre vertex (normal +Z).
+  verts[vi++] = 0.5; verts[vi++] = 0.5; verts[vi++] = 0;
+  verts[vi++] = 0; verts[vi++] = 0; verts[vi++] = 1;
+  for (let i = 0; i < N; i++) {
+    const t = (i / N) * Math.PI * 2 + angleOffset;
+    verts[vi++] = 0.5 + 0.5 * Math.cos(t);
+    verts[vi++] = 0.5 + 0.5 * Math.sin(t);
+    verts[vi++] = 0;
+    verts[vi++] = 0; verts[vi++] = 0; verts[vi++] = 1;
+  }
+  // Same winding as the prism's top face so it stays front-facing after the
+  // MVP's Y-flip (front-face = CCW, back-face culled).
+  for (let i = 0; i < N; i++) {
+    idx[ii++] = 0; idx[ii++] = 1 + ((i + 1) % N); idx[ii++] = 1 + i;
+  }
+  return { verts, idx, idxCount: ii };
+}
+const FLAT_HEX = buildFlatHexTop();
+
 // ---------------------------------------------------------------------------
 // Flat quad: 4 vertices (same attrib layout as box — pos3 + normal3) for
 // shapes with height=0.  Only 6 indices vs 36 (box) or 384 (cylinder).
@@ -372,10 +403,12 @@ export class QuadRenderer {
   private cylinderVAO: WebGLVertexArrayObject;
   private hexVAO: WebGLVertexArrayObject;
   private flatVAO: WebGLVertexArrayObject;
+  private flatHexVAO: WebGLVertexArrayObject;
   private coloredInstance: PoolBuffer;
   private cylinderInstance: PoolBuffer;
   private hexInstance: PoolBuffer;
   private flatInstance: PoolBuffer;
+  private flatHexInstance: PoolBuffer;
   private uColoredMVP: WebGLUniformLocation;
   private uColoredOpacity: WebGLUniformLocation;
 
@@ -407,6 +440,8 @@ export class QuadRenderer {
   private hexIndexBuffer: WebGLBuffer;
   private flatBuffer: WebGLBuffer;
   private flatIndexBuffer: WebGLBuffer;
+  private flatHexBuffer: WebGLBuffer;
+  private flatHexIndexBuffer: WebGLBuffer;
 
   constructor(gl: WebGL2RenderingContext) {
     this.gl = gl;
@@ -447,6 +482,14 @@ export class QuadRenderer {
     this.flatIndexBuffer = gl.createBuffer()!;
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.flatIndexBuffer);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, FLAT_IDX, gl.STATIC_DRAW);
+
+    // Flat hexagon geometry (top-face fan) for height=0 'hexagon' shapes.
+    this.flatHexBuffer = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.flatHexBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, FLAT_HEX.verts, gl.STATIC_DRAW);
+    this.flatHexIndexBuffer = gl.createBuffer()!;
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.flatHexIndexBuffer);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, FLAT_HEX.idx, gl.STATIC_DRAW);
 
     // --- Colored 3D program ---
     this.coloredProg = compileProgram(gl, VS, FS);
@@ -540,6 +583,31 @@ export class QuadRenderer {
     gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 24, 12);
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.flatIndexBuffer);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.flatInstance.gpu);
+    gl.enableVertexAttribArray(2);
+    gl.vertexAttribPointer(2, 4, gl.FLOAT, false, stride, 0);
+    gl.vertexAttribDivisor(2, 1);
+    gl.enableVertexAttribArray(3);
+    gl.vertexAttribPointer(3, 4, gl.FLOAT, false, stride, 16);
+    gl.vertexAttribDivisor(3, 1);
+    gl.enableVertexAttribArray(4);
+    gl.vertexAttribPointer(4, 1, gl.FLOAT, false, stride, 32);
+    gl.vertexAttribDivisor(4, 1);
+    gl.enableVertexAttribArray(5);
+    gl.vertexAttribPointer(5, 4, gl.FLOAT, false, stride, 36);
+    gl.vertexAttribDivisor(5, 1);
+    gl.bindVertexArray(null);
+
+    // --- Flat hexagon VAO (same program + instance layout, top-face fan) ---
+    this.flatHexInstance = makePool(gl, 1024 * COLORED_STRIDE);
+    this.flatHexVAO = gl.createVertexArray()!;
+    gl.bindVertexArray(this.flatHexVAO);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.flatHexBuffer);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 24, 12);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.flatHexIndexBuffer);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.flatHexInstance.gpu);
     gl.enableVertexAttribArray(2);
     gl.vertexAttribPointer(2, 4, gl.FLOAT, false, stride, 0);
     gl.vertexAttribDivisor(2, 1);
@@ -695,6 +763,26 @@ export class QuadRenderer {
     this.stats.bytesUploaded += count * COLORED_STRIDE * 4;
   }
 
+  /**
+   * Draw flat (height=0) hexagon shapes as a top-face fan (18 indices/instance
+   * vs the 72 of a full hex prism). Visually identical to a collapsed prism but
+   * ~4× cheaper per cell — the fast path for the estate's flat honeycomb. Call
+   * bindColored() first.
+   */
+  drawFlatHex(instances: Float32Array, count: number): void {
+    if (count === 0) return;
+    const gl = this.gl;
+    this.ensurePool(this.flatHexInstance, count * COLORED_STRIDE);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.flatHexInstance.gpu);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, instances, 0, count * COLORED_STRIDE);
+    gl.bindVertexArray(this.flatHexVAO);
+    gl.drawElementsInstanced(gl.TRIANGLES, FLAT_HEX.idxCount, gl.UNSIGNED_SHORT, 0, count);
+    gl.bindVertexArray(null);
+    this.stats.drawCalls++;
+    this.stats.coloredInstances += count;
+    this.stats.bytesUploaded += count * COLORED_STRIDE * 4;
+  }
+
   drawTextured(
     instances: Float32Array,
     count: number,
@@ -778,6 +866,7 @@ export class QuadRenderer {
     gl.deleteVertexArray(this.cylinderVAO);
     gl.deleteVertexArray(this.hexVAO);
     gl.deleteVertexArray(this.flatVAO);
+    gl.deleteVertexArray(this.flatHexVAO);
     gl.deleteVertexArray(this.texturedVAO);
     gl.deleteVertexArray(this.vectorVAO);
     gl.deleteVertexArray(this.meshVAO);
@@ -785,6 +874,7 @@ export class QuadRenderer {
     gl.deleteBuffer(this.cylinderInstance.gpu);
     gl.deleteBuffer(this.hexInstance.gpu);
     gl.deleteBuffer(this.flatInstance.gpu);
+    gl.deleteBuffer(this.flatHexInstance.gpu);
     gl.deleteBuffer(this.texturedInstance.gpu);
     gl.deleteBuffer(this.vectorBuffer.gpu);
     gl.deleteBuffer(this.meshBuffer.gpu);
@@ -795,6 +885,10 @@ export class QuadRenderer {
     gl.deleteBuffer(this.cylIndexBuffer);
     gl.deleteBuffer(this.hexBuffer);
     gl.deleteBuffer(this.hexIndexBuffer);
+    gl.deleteBuffer(this.flatBuffer);
+    gl.deleteBuffer(this.flatIndexBuffer);
+    gl.deleteBuffer(this.flatHexBuffer);
+    gl.deleteBuffer(this.flatHexIndexBuffer);
   }
 
   private ensurePool(pool: PoolBuffer, neededFloats: number): void {
@@ -839,17 +933,14 @@ function makePool(gl: WebGL2RenderingContext, floats: number): PoolBuffer {
  * last vertex is implicitly connected back to the first. Returns the new
  * write offset into `out` (in floats).
  */
-function tessellateFillRing(
-  ring: number[],
-  out: Float32Array,
-  offset: number,
-  cx: number,
-  cy: number,
-  r: number,
-  g: number,
-  b: number,
-  a: number
-): number {
+/**
+ * Ear-clip one polygon ring into triangle vertex POSITIONS (world coords),
+ * appended to `out` at `offset` as [x,y] pairs; returns the new offset. This is
+ * the position-only core of the fill tessellation — colour and the camera-
+ * relative shift are applied later (per frame) when the cached result is drawn,
+ * so this O(n²) clip runs once per element instead of every frame.
+ */
+function tessellateFillPos(ring: number[], out: Float32Array, offset: number): number {
   const n = ring.length >> 1;
   if (n < 3) return offset;
 
@@ -858,7 +949,6 @@ function tessellateFillRing(
   const indices: number[] = new Array(n);
   for (let i = 0; i < n; i++) indices[i] = i;
 
-  // Signed area × 2: positive → CCW, negative → CW.
   let area2 = 0;
   for (let i = 0; i < n; i++) {
     const j = (i + 1) % n;
@@ -866,8 +956,6 @@ function tessellateFillRing(
   }
   if (area2 < 0) indices.reverse();
 
-  // Ear-clipping main loop.
-  const stride = VECTOR_STRIDE;
   let remaining = n;
   let guard = remaining * remaining; // safety bound against pathological input
   let i = 0;
@@ -882,18 +970,13 @@ function tessellateFillRing(
     const cxp = ring[i2 * 2];
     const cyp = ring[i2 * 2 + 1];
 
-    // Convex test (cross product of AB × BC, expecting CCW so cross > 0).
     const cross = (bx - ax) * (cyp - ay) - (by - ay) * (cxp - ax);
     let isEar = cross > 0;
-
-    // Containment test: no other vertex of the polygon may lie inside ABC.
     if (isEar) {
       for (let k = 0; k < remaining; k++) {
         if (k === (i + 0) % remaining || k === (i + 1) % remaining || k === (i + 2) % remaining) continue;
         const idx = indices[k];
-        const px = ring[idx * 2];
-        const py = ring[idx * 2 + 1];
-        if (pointInTri(px, py, ax, ay, bx, by, cxp, cyp)) {
+        if (pointInTri(ring[idx * 2], ring[idx * 2 + 1], ax, ay, bx, by, cxp, cyp)) {
           isEar = false;
           break;
         }
@@ -901,48 +984,43 @@ function tessellateFillRing(
     }
 
     if (isEar) {
-      // Emit triangle (a, b, c).
-      out[offset + 0] = ax - cx; out[offset + 1] = ay - cy;
-      out[offset + 2] = r; out[offset + 3] = g; out[offset + 4] = b; out[offset + 5] = a;
-      offset += stride;
-      out[offset + 0] = bx - cx; out[offset + 1] = by - cy;
-      out[offset + 2] = r; out[offset + 3] = g; out[offset + 4] = b; out[offset + 5] = a;
-      offset += stride;
-      out[offset + 0] = cxp - cx; out[offset + 1] = cyp - cy;
-      out[offset + 2] = r; out[offset + 3] = g; out[offset + 4] = b; out[offset + 5] = a;
-      offset += stride;
-      // Drop middle vertex (b).
+      out[offset++] = ax; out[offset++] = ay;
+      out[offset++] = bx; out[offset++] = by;
+      out[offset++] = cxp; out[offset++] = cyp;
       indices.splice((i + 1) % remaining, 1);
       remaining--;
-      // Don't advance i — re-check around the new neighborhood.
     } else {
       i++;
     }
   }
 
-  // Final triangle.
   if (remaining === 3) {
     const i0 = indices[0];
     const i1 = indices[1];
     const i2 = indices[2];
-    const ax = ring[i0 * 2];
-    const ay = ring[i0 * 2 + 1];
-    const bx = ring[i1 * 2];
-    const by = ring[i1 * 2 + 1];
-    const cxp = ring[i2 * 2];
-    const cyp = ring[i2 * 2 + 1];
-    out[offset + 0] = ax - cx; out[offset + 1] = ay - cy;
-    out[offset + 2] = r; out[offset + 3] = g; out[offset + 4] = b; out[offset + 5] = a;
-    offset += stride;
-    out[offset + 0] = bx - cx; out[offset + 1] = by - cy;
-    out[offset + 2] = r; out[offset + 3] = g; out[offset + 4] = b; out[offset + 5] = a;
-    offset += stride;
-    out[offset + 0] = cxp - cx; out[offset + 1] = cyp - cy;
-    out[offset + 2] = r; out[offset + 3] = g; out[offset + 4] = b; out[offset + 5] = a;
-    offset += stride;
+    out[offset++] = ring[i0 * 2]; out[offset++] = ring[i0 * 2 + 1];
+    out[offset++] = ring[i1 * 2]; out[offset++] = ring[i1 * 2 + 1];
+    out[offset++] = ring[i2 * 2]; out[offset++] = ring[i2 * 2 + 1];
   }
   return offset;
 }
+
+/**
+ * Triangulate all of a vector element's fill rings ONCE into a packed triangle
+ * soup of world-space positions ([x0,y0,x1,y1,...]), for caching on the element.
+ * Each ring is triangulated independently (holes are filled), which is what we
+ * want for a solid cluster silhouette. Drawing the cache later only subtracts the
+ * camera centre and writes the colour — no per-frame ear-clipping.
+ */
+function buildFillTris(rings: number[][]): Float32Array {
+  let total = 0;
+  for (const ring of rings) total += fillVertexCount(ring.length >> 1);
+  const out = new Float32Array(total * 2);
+  let off = 0;
+  for (const ring of rings) off = tessellateFillPos(ring, out, off);
+  return out;
+}
+
 
 function pointInTri(
   px: number, py: number,
@@ -1116,4 +1194,4 @@ function strokeVertexCount(n: number, closed: boolean): number {
 }
 
 export { COLORED_STRIDE, TEXTURED_STRIDE, VECTOR_STRIDE, MESH_STRIDE };
-export { tessellateFillRing, tessellateStroke, fillVertexCount, strokeVertexCount };
+export { buildFillTris, tessellateStroke, fillVertexCount, strokeVertexCount };

@@ -23,6 +23,7 @@ import {
   type Axial,
 } from './hex';
 import { HexPlacer, placeHierarchical, placeDense, placeAffinity, type HierItem, type PlacedWorkload } from './placement';
+import type { EntityUpdate, MonitorTarget } from '../../data/types';
 
 export interface HexResourceInput {
   id: string;
@@ -33,6 +34,8 @@ export interface HexResourceInput {
 
 export interface WorkloadInput {
   name: string;
+  /** Stable identifier used to route live data updates. Defaults to `name`. */
+  id?: string;
   /** Number of cells this workload spans. Default 1. */
   size?: number;
   /** Criticality 0..1 (0 = healthy, 1 = critical). */
@@ -219,10 +222,19 @@ function resolvePlacement(opts: HexGridOptions): Map<string, PlacedWorkload> {
   return new Map(opts.workloads.map((w) => [w.name, placer.place(w.name, w.size ?? 1)]));
 }
 
-export class HexGrid extends VizBase {
+export class HexGrid extends VizBase implements MonitorTarget {
   private readonly workloads: LiveWorkload[] = [];
   private readonly byName = new Map<string, LiveWorkload>();
+  /** Optional stable-id index (populated when a WorkloadInput sets `id`), so
+   *  live data can address workloads by a backend id independent of the label. */
+  private readonly byId = new Map<string, LiveWorkload>();
   private readonly cellToWorkload = new Map<string, number>();
+  // Workloads whose criticality / pulse / resources are still tweening. onStep
+  // only walks this set (typically a few hundred incidents) instead of every
+  // cell in the estate, so an idle 50k-cell map costs almost nothing per frame.
+  // Mutators (setCriticality / setResource / triggerAnomaly) enrol a workload;
+  // onStep retires it once every value has settled on its target.
+  private readonly activeWorkloads = new Set<LiveWorkload>();
   private readonly critStops: RGBA[];
   private readonly tweenRate: number;
   private readonly layerBaseZ: number;
@@ -340,6 +352,7 @@ export class HexGrid extends VizBase {
       const idx = this.workloads.length;
       this.workloads.push(live);
       this.byName.set(live.name, live);
+      if (input.id) this.byId.set(input.id, live);
       for (const [q, r] of p.cells) this.cellToWorkload.set(axialKey(q, r), idx);
     }
 
@@ -362,6 +375,7 @@ export class HexGrid extends VizBase {
     const w = this.byName.get(name);
     if (w) {
       w.targetCrit = clamp01(value);
+      this.activeWorkloads.add(w);
       this.scene.markDirty();
     }
   }
@@ -369,9 +383,11 @@ export class HexGrid extends VizBase {
   /** Set a resource's target severity (animates). */
   setResource(name: string, id: string, value: number): void {
     const w = this.byName.get(name);
-    const res = w?.resources.find((r) => r.id === id);
+    if (!w) return;
+    const res = w.resources.find((r) => r.id === id);
     if (res) {
       res.target = clamp01(value);
+      this.activeWorkloads.add(w);
       this.scene.markDirty();
     }
   }
@@ -381,8 +397,47 @@ export class HexGrid extends VizBase {
     const w = this.byName.get(name);
     if (w) {
       w.pulse = Math.max(w.pulse, clamp01(intensity));
+      this.activeWorkloads.add(w);
       this.scene.markDirty();
     }
+  }
+
+  /**
+   * Apply a batch of live entity updates from a DataSource / MonitorFeed. Each
+   * record is routed through the same animated paths as the individual setters
+   * (criticality, resources, anomaly, tint), but the whole batch repaints once —
+   * with no tile rebuilds — so a firehose of updates stays cheap even at 50k
+   * cells. Records are addressed by `id` (falling back to the workload name), so
+   * a backend can stream by stable id regardless of the display label.
+   */
+  applyUpdate(records: readonly EntityUpdate[]): void {
+    let touched = false;
+    for (const r of records) {
+      const w = this.byId.get(r.id) ?? this.byName.get(r.id);
+      if (!w) continue;
+      if (r.severity !== undefined) {
+        w.targetCrit = clamp01(r.severity);
+        this.activeWorkloads.add(w);
+        touched = true;
+      }
+      if (r.anomaly !== undefined && r.anomaly > 0) {
+        w.pulse = Math.max(w.pulse, clamp01(r.anomaly));
+        this.activeWorkloads.add(w);
+        touched = true;
+      }
+      if (r.resources) {
+        for (const ru of r.resources) {
+          const res = w.resources.find((x) => x.id === ru.id);
+          if (res) {
+            res.target = clamp01(ru.value);
+            this.activeWorkloads.add(w);
+            touched = true;
+          }
+        }
+      }
+      if (r.tint !== undefined) w.tint = r.tint;
+    }
+    if (touched) this.scene.markDirty();
   }
 
   /** List placed workloads (for demo drivers). */
@@ -418,7 +473,9 @@ export class HexGrid extends VizBase {
     // Tracks workloads whose layer-0 colour (criticality / pulse) actually
     // moved this step, so we only repaint when something visible changed.
     let colorChanged = false;
-    for (const w of this.workloads) {
+    // Only the enrolled (still-tweening) workloads are walked — a settled estate
+    // of 50k healthy cells has an empty-to-tiny set, so idle frames are free.
+    for (const w of this.activeWorkloads) {
       let wColor = false;
       const d = w.targetCrit - w.crit;
       if (Math.abs(d) > 1e-4) {
@@ -428,11 +485,17 @@ export class HexGrid extends VizBase {
         w.crit = w.targetCrit;
       }
       // Resources tween for deep-zoom sub-cell fills and tooltips; they don't
-      // drive the layer-0 colour, so they don't force a repaint on their own.
+      // drive the layer-0 colour, so they don't force a repaint on their own —
+      // but they DO keep a workload enrolled until they settle.
+      let resSettled = true;
       for (const res of w.resources) {
         const dd = res.target - res.current;
-        if (Math.abs(dd) > 1e-4) res.current += dd * k;
-        else res.current = res.target;
+        if (Math.abs(dd) > 1e-4) {
+          res.current += dd * k;
+          resSettled = false;
+        } else {
+          res.current = res.target;
+        }
       }
       if (w.pulse > 0.001) {
         w.pulse *= decay;
@@ -448,6 +511,10 @@ export class HexGrid extends VizBase {
         // is what keeps 50k live cells at the renderer's full redraw rate
         // instead of re-tessellating the whole estate a few times a second.
         if (health) this.updateHealthFill(w);
+      } else if (resSettled) {
+        // Criticality, pulse, and every resource have reached their targets:
+        // retire the workload so it stops costing anything until it next moves.
+        this.activeWorkloads.delete(w);
       }
     }
     // A categorical territory map is static — no redraw churn while the live
