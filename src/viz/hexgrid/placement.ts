@@ -993,12 +993,27 @@ function seedClusters(
     });
     return true;
   }
-  const pv = [...primary.keys()];
+  // Space the primary clusters by cumulative SIZE, largest first — not by
+  // index. Real estates have wildly uneven top-level groups, and index spacing
+  // hands a two-resource cluster the same inner ring as a ten-thousand-cell
+  // one, which evacuates the middle and leaves the whole estate a hollow ring.
+  const csizeOf = new Map<string, number>();
+  let totalSize = 0;
+  for (const [v, members] of primary) {
+    let s = 0;
+    for (const i of members) s += groups[i].size;
+    csizeOf.set(v, s);
+    totalSize += s;
+  }
+  const pv = [...primary.keys()].sort(
+    (a, b) => (csizeOf.get(b) ?? 0) - (csizeOf.get(a) ?? 0) || (a < b ? -1 : 1),
+  );
+  let cum = 0;
   pv.forEach((v, pi) => {
     const members = (primary.get(v) ?? []).slice().sort(order);
-    let csize = 0;
-    for (const i of members) csize += groups[i].size;
-    const cr = r0 * fill * 0.68 * Math.sqrt((pi + 0.5) / pv.length);
+    const csize = csizeOf.get(v) ?? 1;
+    const cr = r0 * fill * 0.68 * Math.sqrt((cum + csize / 2) / Math.max(1, totalSize));
+    cum += csize;
     const cx = Math.cos(pi * ga) * cr;
     const cy = Math.sin(pi * ga) * cr;
     const local = Math.sqrt(Math.max(1, csize) / Math.PI);

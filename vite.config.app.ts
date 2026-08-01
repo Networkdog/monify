@@ -15,6 +15,7 @@ export default defineConfig({
         estate: resolve(__dirname, 'demos/estate/index.html'),
         treemap: resolve(__dirname, 'demos/treemap/index.html'),
         hexgrid: resolve(__dirname, 'demos/hexgrid/index.html'),
+        workloadMap: resolve(__dirname, 'demos/workload-map/index.html'),
       },
     },
   },

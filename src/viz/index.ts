@@ -4,3 +4,4 @@ export { FlyController, type FlyTarget } from './fly';
 export { Tooltip, type TooltipData } from './tooltip';
 export * from './treemap';
 export * from './hexgrid';
+export * from './workload-map';
