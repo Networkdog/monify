@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "build:app": "tsc --noEmit && vite build --config vite.config.app.ts",
+    "build:estate": "node tools/build-estate.mjs",
     "preview": "vite preview",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",

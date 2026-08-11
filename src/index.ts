@@ -71,3 +71,6 @@ export * from './viz';
 
 // ── Live data pipeline (source-agnostic monitoring feed) ─────────────────────
 export * from './data';
+
+// ── Shape toolkit (user data → cell + layer data) ────────────────────────────
+export * from './shape';

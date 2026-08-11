@@ -1,250 +1,71 @@
-// Estate Monitor — a whole Azure estate as a honeycomb of monitored resources.
+// Estate Monitor — a whole Azure estate as a honeycomb of resources.
 //
-// Every cell is a resource that Azure Resource Health actually reports on (VM,
-// SQL DB, App Service, Key Vault, Firewall, …); pure config/policy resources
-// with no health concept (VNet, NSG, Public IP, Private Endpoint, NIC, route
-// table, firewall policy, App Insights) are left off the wall. Each cell renders
-// as a single hex, laid out with *locality*: cells that share a grouping
-// criterion sit next to each other. The estate models an Azure landing zone on
-// Virtual WAN — 10 secured hubs (Azure Firewall), ~1,000 Prod/Dev subscriptions
-// (a VNet spoke each), 500 workloads. Placement nests by network topology
-// (hub › subscription › resource group), so each hub is a territory and its
-// spoke subscriptions cluster inside it.
+// The estate is a real one: an Azure Resource Graph snapshot, folded into the
+// demo's data file by tools/build-estate.mjs and pseudonymised on the way
+// through. ~62,000 resources across ~580 subscriptions, and the 64,000 links
+// between them — which Resource Graph does not store as links at all, but which
+// are sitting inside each resource's properties as ARM ids: a NIC's virtual
+// machine, a disk's owner, a private endpoint's service.
+//
+// Every cell is one resource, and the map is Azure's own containment tree drawn
+// as nested clusters: a subscription holds resource groups, a resource group
+// holds resources, and each level is walled off by an empty moat that widens the
+// higher up it sits. Nothing can leave its cluster.
+//
+// Inside those walls the arrangement is decided by the estate's own wiring.
+// Linked resources attract like iron filings around a magnet: a machine gathers
+// its NIC and disks into a little molecule, a subscription's resources gather
+// onto the VNet they attach to, and a shared vault or workspace is pulled to the
+// middle of everything that reaches for it. Resources Azure Resource Health
+// reports on carry the live status colour; the config resources it says nothing
+// about (VNet, NSG, NIC, public IP, private endpoint, disk) are drawn in a muted
+// neutral — they are the scaffolding the layout is built around.
+//
+// Only the metrics are invented: a snapshot has no time series in it, so the
+// live severity is driven by a simulator seeded from the snapshot's own health.
 //
 // The in-cell glyph is the resource-type code (its "icon"). Colour is driven by
-// a chosen criterion — Health (live RdYlGn) or a structural dimension (hub /
-// environment / management group / workload / type / subscription). Switching to
-// a structural dimension paints contiguous colour regions, making the locality
-// visible; correlated incidents then light up a whole resource group,
-// subscription, or hub at once.
+// a chosen criterion — Health (live) or a structural dimension — so switching to
+// management group, subscription or service paints the containment levels, and
+// correlated incidents light up one whole cluster.
 
-import { HexGrid, type WorkloadInput } from '../viz/hexgrid';
-import { paletteStops } from '../color';
+import { HexGrid, type LinkStyle, type PlacementSnapshot } from '../viz/hexgrid';
+import { hexToRgba, paletteStops } from '../color';
 import type { RGBA } from '../core/types';
-import { mulberry32, randRange, randInt } from './random';
+import { loadEstate, type Target } from './estate-data';
 import { SimulatedSource, MonitorFeed, type SimEntity } from '../data';
+import { defineDataset, type LegendEntry } from '../shape';
 
-// ── Estate catalogs ──────────────────────────────────────────────────────────
-
-// 10 Virtual WAN secured hubs (each fronted by Azure Firewall), one per region.
-const HUBS = [
-  { id: 'vhub-koreacentral', region: 'koreacentral' },
-  { id: 'vhub-koreasouth', region: 'koreasouth' },
-  { id: 'vhub-japaneast', region: 'japaneast' },
-  { id: 'vhub-southeastasia', region: 'southeastasia' },
-  { id: 'vhub-eastus2', region: 'eastus2' },
-  { id: 'vhub-westus3', region: 'westus3' },
-  { id: 'vhub-westeurope', region: 'westeurope' },
-  { id: 'vhub-northeurope', region: 'northeurope' },
-  { id: 'vhub-uksouth', region: 'uksouth' },
-  { id: 'vhub-australiaeast', region: 'australiaeast' },
-] as const;
-
-const WORKLOAD_COUNT = 500;
-const WORKLOAD_DOMAINS = [
-  'payments', 'orders', 'catalog', 'inventory', 'search', 'billing', 'analytics',
-  'notify', 'media', 'portal', 'crm', 'risk', 'ledger', 'fraud', 'pricing', 'shipping',
-  'returns', 'loyalty', 'recommend', 'chat', 'feed', 'ads', 'wallet', 'invoice', 'tax',
-  'audit', 'reporting', 'datalake', 'mlserving', 'iot', 'telemetry', 'support', 'booking',
-  'maps', 'streaming', 'gaming', 'social', 'docs', 'signing', 'insights',
+// What each wire means. A link's kind is the kind of resource it points at, so
+// these are the relationships the estate is actually made of — and they are not
+// equally interesting: a private endpoint onto a database is a fact worth
+// seeing, while the NIC and disks hanging off every machine are so numerous
+// that they have to stay quiet or they bury everything else.
+// Colour says which kind, thickness and opacity say how much it matters.
+interface LinkKind {
+  id: string;
+  label: string;
+  color: string;
+  alpha: number;
+  width: number;
+}
+const LINK_KINDS: LinkKind[] = [
+  { id: 'connectivity', label: '백본 연결', color: '#22d3ee', alpha: 0.95, width: 1.7 },
+  { id: 'network', label: '네트워크 연결', color: '#38bdf8', alpha: 0.75, width: 1.15 },
+  { id: 'security', label: '시크릿·자격 증명', color: '#fbbf24', alpha: 0.8, width: 1.05 },
+  { id: 'data', label: '데이터 접근', color: '#c084fc', alpha: 0.8, width: 1.05 },
+  { id: 'storage', label: '스토리지 접근', color: '#2dd4bf', alpha: 0.7, width: 1 },
+  { id: 'integration', label: '메시징', color: '#fb923c', alpha: 0.7, width: 1 },
+  { id: 'ai', label: 'AI 서비스', color: '#f472b6', alpha: 0.75, width: 1 },
+  { id: 'monitor', label: '모니터링·백업', color: '#818cf8', alpha: 0.55, width: 0.9 },
+  { id: 'web', label: '앱 연동', color: '#a3e635', alpha: 0.7, width: 1 },
+  { id: 'compute', label: '컴퓨트 부착', color: '#94a3b8', alpha: 0.5, width: 0.85 },
 ];
+const LINK_STYLES: Record<string, LinkStyle> = Object.fromEntries(
+  LINK_KINDS.map((k) => [k.id, { color: hexToRgba(k.color, k.alpha), width: k.width }]),
+);
 
-interface RType {
-  code: string;
-  name: string;
-  kind: string;
-}
-// Only resource types that Azure Resource Health actually reports on live on the
-// wall — this is a health-monitoring estate, so resources with no health concept
-// (pure config/policy: Virtual Network, NSG, Public IP, Private Endpoint, NIC,
-// Route Table, Firewall Policy) and resources Resource Health doesn't surface
-// (App Insights) are intentionally excluded.
-// See: https://learn.microsoft.com/azure/service-health/resource-health-checks-resource-types
-const RTYPES: Record<string, RType> = {
-  VM: { code: 'VM', name: 'Virtual Machine', kind: 'compute' },
-  VMSS: { code: 'VMSS', name: 'VM Scale Set', kind: 'compute' },
-  AKS: { code: 'AKS', name: 'AKS Node Pool', kind: 'compute' },
-  APP: { code: 'APP', name: 'App Service', kind: 'web' },
-  FN: { code: 'FN', name: 'Function App', kind: 'web' },
-  SQL: { code: 'SQL', name: 'Azure SQL DB', kind: 'data' },
-  COS: { code: 'COS', name: 'Cosmos DB', kind: 'data' },
-  PG: { code: 'PG', name: 'PostgreSQL', kind: 'data' },
-  RDS: { code: 'RDS', name: 'Redis Cache', kind: 'data' },
-  STG: { code: 'STG', name: 'Storage Account', kind: 'storage' },
-  SB: { code: 'SB', name: 'Service Bus', kind: 'integration' },
-  EH: { code: 'EH', name: 'Event Hub', kind: 'integration' },
-  KV: { code: 'KV', name: 'Key Vault', kind: 'security' },
-  LAW: { code: 'LAW', name: 'Log Analytics', kind: 'monitor' },
-  LB: { code: 'LB', name: 'Load Balancer', kind: 'network' },
-  AGW: { code: 'AGW', name: 'Application Gateway', kind: 'network' },
-  VHUB: { code: 'VHUB', name: 'Virtual WAN Hub', kind: 'connectivity' },
-  FW: { code: 'FW', name: 'Azure Firewall', kind: 'connectivity' },
-  VPN: { code: 'VPN', name: 'VPN Gateway', kind: 'connectivity' },
-  ER: { code: 'ER', name: 'ExpressRoute Gateway', kind: 'connectivity' },
-};
-
-const METRIC_KINDS = ['cpu', 'mem', 'net', 'disk', 'lat', 'err'];
-
-// ── Generated model ──────────────────────────────────────────────────────────
-
-interface Target {
-  name: string;
-  mg: string;
-  sub: string;
-  rg: string;
-  workload: string;
-  hub: string;
-  region: string;
-  env: string;
-  typeCode: string;
-  typeName: string;
-  kind: string;
-  base: number;
-  metrics: { id: string; base: number }[];
-}
-
-function pad(n: number, w: number): string {
-  return String(n).padStart(w, '0');
-}
-
-interface SubCtx {
-  mg: string;
-  sub: string;
-  workload: string;
-  hub: string;
-  region: string;
-  env: string;
-}
-
-/** Build the estate: 10 vWAN hubs › ~1,010 subscriptions (Prod/Dev + connectivity) › RGs ›
- *  health-reported resources. Per-workload size: 95% of workloads sit near ~50 resources,
- *  while a rare 5% vary widely, spreading from 50 up to 300. */
-function buildEstate(rng: () => number): Target[] {
-  const targets: Target[] = [];
-  let seq = 0;
-
-  const metricsFor = (): { id: string; base: number }[] => {
-    const n = randInt(rng, 2, 4);
-    return Array.from({ length: n }, (_, m) => ({
-      id: METRIC_KINDS[m % METRIC_KINDS.length],
-      base: randRange(rng, 0.04, 0.28),
-    }));
-  };
-
-  const emit = (ctx: SubCtx, rg: string, code: string): void => {
-    const rt = RTYPES[code];
-    seq++;
-    targets.push({
-      name: `${ctx.workload}-${code.toLowerCase()}-${pad(seq, 6)}`,
-      mg: ctx.mg,
-      sub: ctx.sub,
-      rg,
-      workload: ctx.workload,
-      hub: ctx.hub,
-      region: ctx.region,
-      env: ctx.env,
-      typeCode: rt.code,
-      typeName: rt.name,
-      kind: rt.kind,
-      // Dev runs a touch hotter (noisier); prod/platform baselines are calmer.
-      base: randRange(rng, 0.03, ctx.env === 'dev' ? 0.2 : 0.11),
-      metrics: metricsFor(),
-    });
-  };
-
-  // Emit `[code, min, max]` random counts of resources into a resource group,
-  // scaled by an optional per-workload multiplier so some workloads sprawl.
-  const gen = (ctx: SubCtx, rg: string, specs: [string, number, number][], scale = 1): void => {
-    for (const [code, lo, hi] of specs) {
-      const n = Math.round(randInt(rng, lo, hi) * scale);
-      for (let i = 0; i < n; i++) emit(ctx, rg, code);
-    }
-  };
-
-  // Per-workload resource multiplier. Most workloads (95%) stay near the ~50
-  // baseline; only a rare 5% vary widely, spreading anywhere from 50 up to 300
-  // resources. Baseline (scale 1) is ~56 resources per workload (its prod + dev
-  // subs), so a target of T resources ⇒ scale = T/56.
-  const WORKLOAD_BASE = 56;
-  const workloadScale = (): number => {
-    const t = rng() < 0.95
-      ? 50 // the 95%: ~50 resources (only the baseline's own spread varies them)
-      : 50 + 250 * rng(); // the rare 5%: spread widely across 50–300
-    return t / WORKLOAD_BASE;
-  };
-
-  // 500 workloads; workload i is homed in hub i % HUBS.length (its prod & dev subs together).
-  const workloads: string[] = [];
-  for (let i = 0; i < WORKLOAD_COUNT; i++) {
-    const domain = WORKLOAD_DOMAINS[i % WORKLOAD_DOMAINS.length];
-    workloads.push(`${domain}-${pad(Math.floor(i / WORKLOAD_DOMAINS.length) + 1, 2)}`);
-  }
-
-  HUBS.forEach((hub, h) => {
-    // Platform / connectivity subscription: the Virtual WAN hub + Firewall + gateways.
-    const conn: SubCtx = {
-      mg: 'platform',
-      sub: `sub-connectivity-${hub.region}`,
-      workload: 'connectivity',
-      hub: hub.id,
-      region: hub.region,
-      env: 'platform',
-    };
-    const connRg = `rg-connectivity-${hub.region}`;
-    emit(conn, connRg, 'VHUB');
-    emit(conn, connRg, 'FW');
-    emit(conn, connRg, 'VPN');
-    emit(conn, connRg, 'ER');
-    gen(conn, `rg-platform-mgmt-${hub.region}`, [['LAW', 1, 2], ['STG', 1, 3], ['KV', 1, 2], ['VM', 1, 3]]);
-
-    // Workload subscriptions homed in this hub — prod first, then dev. Each
-    // workload gets a size multiplier (most modest, a few sprawling 3×+) applied
-    // to both its prod and dev subs, so resource counts vary widely.
-    const hubWorkloads = workloads.filter((_, i) => i % HUBS.length === h);
-    const scaleOf = new Map<string, number>();
-    for (const wl of hubWorkloads) scaleOf.set(wl, workloadScale());
-    for (const env of ['prod', 'dev'] as const) {
-      const mg = env === 'prod' ? 'lz-prod' : 'lz-dev';
-      for (const wl of hubWorkloads) {
-        const scale = scaleOf.get(wl) ?? 1;
-        const ctx: SubCtx = { mg, sub: `sub-${wl}-${env}`, workload: wl, hub: hub.id, region: hub.region, env };
-        // Spoke network: the load balancer is the only network resource with a
-        // health concept — the VNet/NSG/PIP/PE/NIC/route-table config resources
-        // are excluded because Resource Health doesn't report on them.
-        const netRg = `rg-${wl}-${env}-net`;
-        gen(ctx, netRg, [['LB', 0, 2]], scale);
-        gen(ctx, `rg-${wl}-${env}-web`, [['APP', 2, 6], ['FN', 1, 4], ['AGW', 0, 2]], scale);
-        gen(ctx, `rg-${wl}-${env}-app`, [['VM', 2, 7], ['VMSS', 0, 2], ['AKS', 0, 2]], scale);
-        gen(ctx, `rg-${wl}-${env}-data`, [['SQL', 1, 3], ['COS', 0, 2], ['PG', 0, 2], ['RDS', 0, 2], ['STG', 1, 3]], scale);
-        gen(ctx, `rg-${wl}-${env}-shared`, [['KV', 1, 2], ['STG', 1, 2], ['LAW', 0, 1]], scale);
-        // Larger workloads are likelier to run a messaging tier.
-        if (rng() < Math.min(0.95, 0.5 + 0.15 * scale)) {
-          gen(ctx, `rg-${wl}-${env}-integration`, [['SB', 1, 3], ['EH', 0, 3]], scale);
-        }
-      }
-    }
-  });
-
-  return targets;
-}
-
-// ── Categorical colouring ────────────────────────────────────────────────────
-
-function hslToRgb(h: number, s: number, l: number): [number, number, number] {
-  const a = s * Math.min(l, 1 - l);
-  const f = (n: number): number => {
-    const k = (n + h * 12) % 12;
-    return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
-  };
-  return [f(0), f(8), f(4)];
-}
-
-/** Distinct, stable hue per category index (golden-angle spread). */
-function categoryColor(index: number): RGBA {
-  const hue = (index * 0.6180339887) % 1;
-  const [r, g, b] = hslToRgb(hue, 0.55, 0.58);
-  return [r, g, b, 1];
-}
+// ── Colour dimensions ────────────────────────────────────────────────────────
 
 interface DimSpec {
   id: string;
@@ -253,41 +74,23 @@ interface DimSpec {
 }
 const DIMS: DimSpec[] = [
   { id: 'health', label: '상태 (Health)' },
-  { id: 'hub', label: '허브 (vWAN)', keyOf: (t) => t.hub },
-  { id: 'env', label: '환경', keyOf: (t) => t.env },
+  { id: 'mgtop', label: '관리 그룹(상위)', keyOf: (t) => t.mgTop },
   { id: 'mg', label: '관리 그룹', keyOf: (t) => t.mg },
-  { id: 'workload', label: '워크로드', keyOf: (t) => t.workload },
-  { id: 'type', label: '리소스 종류', keyOf: (t) => t.typeCode },
+  { id: 'hub', label: '허브 (vWAN)', keyOf: (t) => t.hub },
   { id: 'sub', label: '구독', keyOf: (t) => t.sub },
+  { id: 'rg', label: '리소스 그룹', keyOf: (t) => t.rg },
+  { id: 'service', label: '서비스', keyOf: (t) => t.service },
+  { id: 'env', label: '환경', keyOf: (t) => t.env },
+  { id: 'grade', label: '서비스 등급', keyOf: (t) => t.grade },
+  { id: 'region', label: '리전', keyOf: (t) => t.region },
+  { id: 'type', label: '리소스 종류', keyOf: (t) => t.typeCode },
 ];
-
-interface DimColoring {
-  tints: RGBA[]; // per target index, aligned to `targets`
-  legend: { key: string; color: RGBA; count: number }[];
-}
-
-const NEUTRAL_TINT: RGBA = [0.5, 0.55, 0.62, 1];
-
-/** Precompute a colour per target + a legend for one structural dimension. */
-function buildColoring(targets: Target[], keyOf: (t: Target) => string): DimColoring {
-  const counts = new Map<string, number>();
-  for (const t of targets) {
-    const k = keyOf(t);
-    counts.set(k, (counts.get(k) ?? 0) + 1);
-  }
-  // Stable index by descending count then name, so big regions get spread hues.
-  const entries = [...counts.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1));
-  const color = new Map<string, RGBA>();
-  entries.forEach(([k], i) => color.set(k, categoryColor(i)));
-  const tints = targets.map((t) => color.get(keyOf(t)) ?? NEUTRAL_TINT);
-  const legend = entries.map(([k, count]) => ({ key: k, color: color.get(k) ?? NEUTRAL_TINT, count }));
-  return { tints, legend };
-}
 
 // ── UI ───────────────────────────────────────────────────────────────────────
 
 function healthStops(): RGBA[] {
-  return paletteStops('rdylgn').slice().reverse();
+  // `status` runs critical→healthy; reverse for a healthy→critical legend ramp.
+  return paletteStops('status').slice().reverse();
 }
 
 function rgbaCss(c: RGBA, a = 1): string {
@@ -314,7 +117,35 @@ function renderSegmented(
   };
 }
 
-function renderLegend(el: HTMLElement, dimId: string, colorings: Map<string, DimColoring>): void {
+/** Swatches for the wire kinds actually present, drawn at their own thickness
+ *  and opacity so the legend reads the way the map does. Each row toggles its
+ *  kind on the map. */
+function wireLegend(kinds: LinkKind[], hidden: Set<string>): string {
+  if (kinds.length === 0) return '';
+  const rows = kinds
+    .map((k) => {
+      const off = hidden.has(k.id);
+      return (
+        `<div class="lrow wk${off ? ' off' : ''}" data-kind="${k.id}">` +
+        `<span class="lw" style="background:${k.color};opacity:${off ? 0.25 : k.alpha};` +
+        `height:${Math.max(2, Math.round(k.width * 2))}px"></span>` +
+        `<span class="lk">${k.label}</span></div>`
+      );
+    })
+    .join('');
+  return (
+    `<div class="lt lwt">연결선 종류 <span class="lg">(클릭=끄기)</span></div>` +
+    `<div class="lgrid">${rows}</div>`
+  );
+}
+
+function renderLegend(
+  el: HTMLElement,
+  dimId: string,
+  legends: Map<string, LegendEntry[]>,
+  wireKinds: LinkKind[],
+  hidden: Set<string>,
+): void {
   const spec = DIMS.find((d) => d.id === dimId) ?? DIMS[0];
   if (dimId === 'health') {
     const stops = healthStops().map((c) => rgbaCss(c)).join(', ');
@@ -322,13 +153,14 @@ function renderLegend(el: HTMLElement, dimId: string, colorings: Map<string, Dim
       `<div class="lt">색상 기준 · ${spec.label}</div>` +
       `<div style="height:10px;border-radius:3px;background:linear-gradient(90deg, ${stops})"></div>` +
       `<div class="lr"><span>healthy</span><span>warning</span><span>critical</span></div>` +
-      `<div class="ln">색 = 심각도 · 이상 발생 시 붉게 점멸</div>`;
+      `<div class="ln">색 = 심각도 · 이상 발생 시 붉게 점멸</div>` +
+      wireLegend(wireKinds, hidden);
     return;
   }
-  const c = colorings.get(dimId);
-  if (!c) return;
+  const entries = legends.get(dimId);
+  if (!entries) return;
   const MAX = 12;
-  const shown = c.legend.slice(0, MAX);
+  const shown = entries.slice(0, MAX);
   const rows = shown
     .map(
       (e) =>
@@ -336,104 +168,182 @@ function renderLegend(el: HTMLElement, dimId: string, colorings: Map<string, Dim
         `<span class="lk">${e.key}</span><span class="lc">${e.count}</span></div>`,
     )
     .join('');
-  const more = c.legend.length > MAX ? `<div class="lmore">그 외 ${c.legend.length - MAX}개…</div>` : '';
+  const more = entries.length > MAX ? `<div class="lmore">그 외 ${entries.length - MAX}개…</div>` : '';
   el.innerHTML =
-    `<div class="lt">색상 기준 · ${spec.label} <span class="lg">(${c.legend.length}개 그룹)</span></div>` +
+    `<div class="lt">색상 기준 · ${spec.label} <span class="lg">(${entries.length}개 그룹)</span></div>` +
     `<div class="lgrid">${rows}</div>${more}` +
-    `<div class="ln">같은 색 = 같은 ${spec.label} · 인접 셀로 로컬리티 확인</div>`;
+    `<div class="ln">같은 색 = 같은 ${spec.label} · 인접 셀로 로컬리티 확인</div>` +
+    wireLegend(wireKinds, hidden);
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
-function main(): void {
+// A baked layout is kept in IndexedDB. Laying ~50k resources out costs seconds,
+// but the reason to keep it is that this is a packing: adding one resource
+// shifts everything after it, and a monitoring wall is only useful once someone
+// has learned where things are. A real deployment would bake it server-side, so
+// every operator sees the same map rather than one per browser.
+const LAYOUT_DB = 'monify-estate';
+const LAYOUT_STORE = 'layout';
+const LAYOUT_ID = 'force';
+
+function openLayoutDb(): Promise<IDBDatabase | null> {
+  return new Promise((resolve) => {
+    try {
+      const req = indexedDB.open(LAYOUT_DB, 1);
+      req.onupgradeneeded = (): void => {
+        req.result.createObjectStore(LAYOUT_STORE);
+      };
+      req.onsuccess = (): void => resolve(req.result);
+      req.onerror = (): void => resolve(null);
+    } catch {
+      resolve(null); // blocked storage: just lay the estate out again
+    }
+  });
+}
+
+async function loadLayout(): Promise<PlacementSnapshot | null> {
+  const db = await openLayoutDb();
+  if (!db) return null;
+  return new Promise((resolve) => {
+    const req = db.transaction(LAYOUT_STORE, 'readonly').objectStore(LAYOUT_STORE).get(LAYOUT_ID);
+    req.onsuccess = (): void => resolve((req.result as PlacementSnapshot | undefined) ?? null);
+    req.onerror = (): void => resolve(null);
+  });
+}
+
+async function saveLayout(snap: PlacementSnapshot): Promise<void> {
+  const db = await openLayoutDb();
+  if (!db) return;
+  db.transaction(LAYOUT_STORE, 'readwrite').objectStore(LAYOUT_STORE).put(snap, LAYOUT_ID);
+}
+
+async function main(): Promise<void> {
   const canvas = document.getElementById('view') as HTMLCanvasElement;
   const hud = document.getElementById('hud') as HTMLDivElement;
   const legend = document.getElementById('legend') as HTMLDivElement;
   const controls = document.getElementById('controls') as HTMLDivElement;
+  const relationControls = document.getElementById('relations') as HTMLDivElement;
+  const focusControls = document.getElementById('focus') as HTMLDivElement;
 
-  const rng = mulberry32(1337);
-  const targets = buildEstate(rng);
+  const estate = await loadEstate();
+  const targets = estate.targets;
 
-  // Precompute colourings for every structural dimension.
-  const colorings = new Map<string, DimColoring>();
-  for (const d of DIMS) if (d.keyOf) colorings.set(d.id, buildColoring(targets, d.keyOf));
+  // Declare what the rows mean once; the shape toolkit derives the cells, the
+  // categorical colourings and their legends from this single description.
+  const ds = defineDataset<Target>({
+    data: targets,
+    id: (t) => t.name,
+    // Containment, outermost first: the management group that governs a
+    // subscription, the subscription, and the resource group. The hub is not a
+    // wall — it pulls (see `anchor` below), so spokes compete for it against
+    // everything else holding them.
+    hierarchy: {
+      mg: (t) => t.mg,
+      sub: (t) => t.sub,
+      rg: (t) => t.rg,
+    },
+    measures: { severity: { value: (t) => t.base, agg: 'worst', domain: [0, 1] } },
+    dimensions: Object.fromEntries(
+      DIMS.flatMap((d) => (d.keyOf ? [[d.id, { of: d.keyOf, label: d.label }]] : [])),
+    ),
+  });
 
-  // 'All' layout: an *affinity* placement built for incident monitoring. The
-  // point of the map is to make blast radius legible — resources that fail
-  // together should sit together, so a correlated incident lights up one
-  // contiguous patch and the eye can judge "where" and "how far". Placement is
-  // therefore driven by the estate's failure-correlation dimensions: a
-  // force-directed model attracts territories that share a hub (region), then a
-  // workload (its prod+dev subscriptions), while every territory repels the rest.
-  // Subscriptions become contiguous blobs, resource groups a patch within them,
-  // and same-hub subscriptions gather into an organic region — no rigid hexagon.
-  // `affinityPath` gives each cell its attribute vector (coarse→fine) + a leaf
-  // for sub-ordering; AFFINITY_WEIGHTS tunes the pull. `central` (per resource
-  // kind) then pulls shared infrastructure — the spoke network and the hub's
-  // connectivity backbone — toward the middle of each cluster, so the map reads
-  // as leaf tissue: hub lobes, workload areoles, and network at every core.
-  // Deterministic.
-  const affinityPath = (t: Target): string[] => [t.hub, t.workload, t.sub, t.rg];
-  const AFFINITY_WEIGHTS = [1.1, 1.3, 0]; // hub · workload · subscription (workload = the base cluster)
+  // One legend per structural dimension (colours assigned by descending count).
+  const legends = new Map<string, LegendEntry[]>();
+  for (const d of DIMS) if (d.keyOf) legends.set(d.id, ds.legend(d.id));
 
-  // How "shared" each resource kind is → higher values sit nearer the centre of
-  // their cluster. Connectivity (vWAN hub, firewall) is the most shared; the
-  // network ingress (load balancer, app gateway) is shared across a workload's
-  // backends; compute/web/data are workload-specific leaves at the edges.
-  const CENTRALITY: Record<string, number> = {
-    connectivity: 1.0,
-    network: 0.8,
-    security: 0.55,
-    monitor: 0.5,
-    storage: 0.4,
-    integration: 0.3,
-    data: 0.15,
-    web: 0.1,
-    compute: 0.1,
-  };
+  // Where a resource sits is an argument between the things Azure says about
+  // it, and these numbers are the terms of that argument. Cohesion is graded by
+  // depth — a resource group holds its contents hardest, a subscription holds
+  // its groups less, a management group holds its subscriptions least — so the
+  // three levels stay separately readable instead of fusing into one mass.
+  // Against them pull the dependencies (a private endpoint toward its database)
+  // and the Virtual WAN hub (every subscription peered to the same one drifts
+  // together), which is what makes a fault's position tell you whose it is.
+  const COHESION = [0.012, 0.03, 0.075, 0.16];
+  const MOATS = [4, 2, 1];
+  const LINK_K = 0.035;
+  const HUB_K = 0.014;
 
-  // HexGrid inputs — one cell per resource. `groupPath` is the affinity attribute
-  // vector (hub › workload › subscription › resource group); it drives the
-  // force-directed 'All' placement and the zoom-out aggregation levels.
-  const inputs: WorkloadInput[] = targets.map((t) => ({
-    name: t.name,
-    size: 1,
-    criticality: t.base,
-    groupPath: affinityPath(t),
-    central: CENTRALITY[t.kind] ?? 0.1,
-    label: t.typeCode,
-    tooltip: [
-      `type: ${t.typeName} (${t.typeCode})`,
-      `workload: ${t.workload}`,
-      `resource group: ${t.rg}`,
-      `subscription: ${t.sub} · ${t.env}`,
-      `mgmt group: ${t.mg}`,
-      `hub: ${t.hub} · ${t.region}`,
-    ],
-    resources: t.metrics.map((m) => ({ id: m.id, value: m.base })),
-  }));
+  // HexGrid inputs — one cell per resource.
+  const compiled = ds.toHexGrid(
+    {
+      status: { by: 'severity' },
+      label: (t) => t.typeCode,
+      central: (t) => t.central,
+      monitored: (t) => t.monitored,
+      links: (t) => t.deps,
+      anchor: (t) => t.hub,
+      resources: (t) => t.metrics.map((m) => ({ id: m.id, value: m.base })),
+      tooltip: (t) => [
+        `type: ${t.typeName} (${t.typeCode})`,
+        ...(t.monitored ? [] : ['health: not reported by Resource Health']),
+        `resource group: ${t.rg}`,
+        `subscription: ${t.sub} · ${t.env}`,
+        `hub: ${t.hub}`,
+        `mgmt group: ${t.mgTop} › ${t.mg}`,
+        `service: ${t.service} · grade ${t.grade}`,
+        `region: ${t.region}`,
+        ...(t.deps.length > 0
+          ? [
+              `linked to: ${t.deps.slice(0, 3).map((d) => `${d.id} (${d.kind})`).join(', ')}` +
+                (t.deps.length > 3 ? ` (+${t.deps.length - 3} more)` : ''),
+            ]
+          : []),
+      ],
+    },
+    { placement: 'force', moats: MOATS },
+  );
 
   // Live data pipeline: a SimulatedSource stands in for a real monitoring
   // backend (Azure Monitor, Prometheus, a WebSocket feed…), streaming batches of
   // correlated incidents that a MonitorFeed routes into the grid. Its group
-  // levels [hub, subscription, resource group] reproduce the estate's
-  // blast-radius correlation (coarse groups rarer but wider), so dropping in a
-  // WebSocketSource later needs no change to the visualization.
-  const simEntities: SimEntity[] = targets.map((t) => ({
-    id: t.name,
-    baseline: t.base,
-    groups: [t.hub, t.sub, t.rg],
-    resources: t.metrics.map((m) => m.id),
-  }));
+  // levels [management group, subscription, resource group] reproduce the way a
+  // real fault spreads (coarse groups rarer but wider), so dropping in a
+  // WebSocketSource later needs no change to the visualization. Only resources
+  // Resource Health reports on take part; the config scaffolding stays neutral.
+  const simEntities: SimEntity[] = targets
+    .filter((t) => t.monitored)
+    .map((t) => ({
+      id: t.name,
+      baseline: t.base,
+      groups: [t.mg, t.sub, t.rg],      resources: t.metrics.map((m) => m.id),
+    }));
 
   // Latest severity per entity, tracked off the same stream for the HUD counts.
   const severity = new Map<string, number>();
+
+  // Only the link kinds this estate actually contains reach the legend.
+  const present = new Set<string>();
+  for (const t of targets) for (const d of t.deps) present.add(d.kind);
+  const wireKinds = LINK_KINDS.filter((k) => present.has(k.id));
 
   let grid: HexGrid | null = null;
   let source: SimulatedSource | null = null;
   let feed: MonitorFeed | null = null;
   let hudTimer = 0;
   let colorBy = 'health';
+  let relations = true;
+  let focusMode = false;
+  const hiddenKinds = new Set<string>();
+  let savedLayout: PlacementSnapshot | null = null;
+
+  function drawLegend(): void {
+    renderLegend(legend, colorBy, legends, relations ? wireKinds : [], hiddenKinds);
+  }
+
+  // The wire-kind rows in the legend double as switches for their kind.
+  legend.addEventListener('click', (e) => {
+    const row = (e.target as HTMLElement).closest('.wk');
+    const kind = row?.getAttribute('data-kind');
+    if (!kind) return;
+    const show = hiddenKinds.has(kind);
+    if (show) hiddenKinds.delete(kind);
+    else hiddenKinds.add(kind);
+    grid?.setLinkKindVisible(kind, show);
+    drawLegend();
+  });
 
   function applyColorBy(id: string): void {
     colorBy = id;
@@ -442,14 +352,30 @@ function main(): void {
     if (id === 'health') {
       g.setColorMode('health');
     } else {
-      const dc = colorings.get(id);
-      if (dc) {
-        targets.forEach((t, i) => g.setTint(t.name, dc.tints[i]));
-        g.setColorMode('category');
-      }
+      const tints = ds.tints(id);
+      targets.forEach((t, i) => g.setTint(t.name, tints[i]));
+      g.setColorMode('category');
     }
     setActiveColor(id);
-    renderLegend(legend, id, colorings);
+    drawLegend();
+  }
+
+  // Zoomed in, every cell gets the bed of the resource group it lives in and a
+  // wire to each resource it is attached to. Turning it off leaves the bare
+  // honeycomb, which is the fair comparison for what the cues actually add.
+  function applyRelations(id: string): void {
+    relations = id === 'on';
+    grid?.setRelations(relations);
+    setActiveRelations(id);
+    drawLegend();
+  }
+
+  // Hover focus is a mode rather than always-on: it redraws the map for every
+  // cell the pointer touches, which flickers when you are only moving across.
+  function applyFocusMode(id: string): void {
+    focusMode = id === 'on';
+    grid?.setFocusMode(focusMode);
+    setActiveFocus(id);
   }
 
   function updateHud(): void {
@@ -468,23 +394,42 @@ function main(): void {
       `<b>${g.fps} fps</b> · ${targets.length.toLocaleString()} resources · ` +
       `<span class="crit">${critical} critical</span> · <span class="warn">${warning} warning</span> · ` +
       `${incidents} incidents<br>` +
-      `색상: ${dim.label} · zoom ${g.scene.camera.zoom.toFixed(1)}`;
+      `색상: ${dim.label} · zoom ${g.scene.camera.zoom.toFixed(1)}<br>` +
+      `<span style="opacity:.65">Resource Graph 스냅샷 ${estate.generated}` +
+      `${estate.anonymized ? ' · 식별자 가명 처리됨' : ' · 실명'}</span>`;
   }
 
-  // Build the affinity ('All') grid and reset the sim. Each input's groupPath
-  // (set above) drives the force-directed placement + zoom-out aggregation.
+  // Build the containment grid and reset the sim. Each input's groupPath (the
+  // management group › subscription › resource group it lives in) walls the
+  // clusters, while its `deps` arrange the contents inside them.
   function mount(): void {
     if (hudTimer) clearInterval(hudTimer);
     feed?.stop();
     source?.stop();
     grid?.destroy();
     grid = new HexGrid(canvas, {
-      workloads: inputs,
-      placement: 'affinity',
-      affinityWeights: AFFINITY_WEIGHTS,
+      workloads: compiled.workloads,
+      placement: compiled.placement,
+      moats: compiled.moats,
+      cohesion: COHESION,
+      linkK: LINK_K,
+      anchorK: HUB_K,
+      affinityWeights: compiled.affinityWeights,
       firstLayerZoom: 12,
+      layout: savedLayout,
+      onLayout: (snap) => {
+        savedLayout = snap;
+        void saveLayout(snap);
+      },
+      // Off for now: the zoomed-out view shows every cell, so the nesting and
+      // the wiring that shapes it stay visible instead of folding into glyphs.
+      aggregate: false,
       tweenRate: 4,
+      relations,
+      focusMode,
+      linkStyles: LINK_STYLES,
     });
+    for (const k of hiddenKinds) grid.setLinkKindVisible(k, false);
     applyColorBy(colorBy);
 
     // Wire the live feed into the freshly-built grid. Swapping SimulatedSource
@@ -502,7 +447,34 @@ function main(): void {
   }
 
   const setActiveColor = renderSegmented(controls, DIMS, applyColorBy);
+  const setActiveRelations = renderSegmented(
+    relationControls,
+    [
+      { id: 'on', label: '바탕+연결선' },
+      { id: 'off', label: '끄기' },
+    ],
+    applyRelations,
+  );
+  setActiveRelations('on');
+  const setActiveFocus = renderSegmented(
+    focusControls,
+    [
+      { id: 'on', label: '연결만 강조' },
+      { id: 'off', label: '끄기' },
+    ],
+    applyFocusMode,
+  );
+  setActiveFocus('off');
+  savedLayout = await loadLayout();
   mount();
 }
 
-main();
+// A missing snapshot is a setup problem, not a crash — say what to run.
+void main().catch((err: unknown) => {
+  const hud = document.getElementById('hud');
+  if (hud) {
+    hud.innerHTML =
+      `<b class="crit">데이터 없음</b><br><span style="opacity:.8">${String(err)}</span>`;
+  }
+  console.error(err);
+});

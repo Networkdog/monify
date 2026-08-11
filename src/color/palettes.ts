@@ -5,13 +5,17 @@
 // Sources:
 //   - Sequential (viridis, inferno, magma, plasma, cividis): matplotlib.
 //     Perceptually uniform; cividis is optimized for color-vision deficiency.
-//   - Diverging (rdbu, piyg, brbg): ColorBrewer. Meaningful midpoint.
-//   - Categorical (tableau10, set2): Tableau 10 and ColorBrewer Set2.
-//     Chosen for maximal perceptual separation; set2 is colorblind-friendly.
+//   - Diverging (rdbu, piyg, brbg, rdylgn): ColorBrewer. Meaningful midpoint.
+//   - status: Tailwind CSS palette steps, arranged as a monitoring ramp (see
+//     below). Default health ramp for this library.
+//   - Categorical (aurora): Tailwind CSS step-400 hues — one lightness step, so
+//     no category shouts louder than another on a dark canvas. Default here.
+//   - Categorical (tableau10, set2): Tableau 10 and ColorBrewer Set2, kept for
+//     light backgrounds and print-like output.
 
 export type SequentialName = 'viridis' | 'inferno' | 'magma' | 'plasma' | 'cividis';
-export type DivergingName = 'rdbu' | 'piyg' | 'brbg' | 'rdylgn';
-export type CategoricalName = 'tableau10' | 'set2';
+export type DivergingName = 'rdbu' | 'piyg' | 'brbg' | 'rdylgn' | 'status';
+export type CategoricalName = 'aurora' | 'tableau10' | 'set2';
 export type PaletteName = SequentialName | DivergingName | CategoricalName;
 
 /** Sequential palettes — ordered from low (0) to high (1). */
@@ -62,10 +66,31 @@ export const DIVERGING: Record<DivergingName, readonly string[]> = {
     '#ffffbf',
     '#d9ef8b', '#a6d96a', '#66bd63', '#1a9850', '#006837',
   ],
+  // Monitoring status ramp, critical (index 0) → healthy (last), so a caller
+  // samples it with (1 - severity). Built from Tailwind rose/orange/amber/
+  // yellow/lime/green/emerald steps.
+  //
+  // Unlike RdYlGn — whose *midpoint* is its brightest colour, so a wall of
+  // warnings out-shouts the outages — this ramp fades toward a deep emerald at
+  // the healthy end. A healthy estate settles into the background and anything
+  // off-baseline is the only saturated thing on screen.
+  status: [
+    '#f43f5e', '#fb7185', '#f97316', '#fb923c', '#fbbf24',
+    '#facc15',
+    '#a3e635', '#4ade80', '#10b981', '#059669', '#065f46',
+  ],
 };
 
 /** Categorical palettes — indexed by category (wraps modulo length). */
 export const CATEGORICAL: Record<CategoricalName, readonly string[]> = {
+  // Tailwind step-400 hues, ordered so neighbouring categories land on opposite
+  // sides of the hue circle. Holding one lightness step keeps every category
+  // equally loud, which is what makes a categorical map readable: difference in
+  // hue means difference in data, and nothing else.
+  aurora: [
+    '#38bdf8', '#fb7185', '#34d399', '#c084fc', '#fbbf24', '#22d3ee',
+    '#f472b6', '#a3e635', '#818cf8', '#fb923c', '#2dd4bf', '#e879f9',
+  ],
   tableau10: [
     '#4e79a7', '#f28e2b', '#e15759', '#76b7b2', '#59a14f',
     '#edc948', '#b07aa1', '#ff9da7', '#9c755f', '#bab0ac',

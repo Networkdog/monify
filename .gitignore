@@ -9,3 +9,11 @@ coverage/
 .captures/*
 !.captures/.gitkeep
 .playwright-mcp/
+
+# Scratch space for one-off analysis scripts
+.tmp/
+
+# The estate demo's dataset: built from an Azure Resource Graph dump by
+# tools/build-estate.mjs. Pseudonymised, but still a derived picture of someone's
+# tenant — regenerate it locally rather than committing one.
+public/estate.json

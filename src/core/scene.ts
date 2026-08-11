@@ -1,4 +1,5 @@
 import { Camera, resetTilePool, visibleTiles, zoomLayers } from './camera';
+import { BACKGROUND } from '../color/tokens';
 import { TILE_SIZE } from './constants';
 import {
   LayerComposer,
@@ -16,7 +17,14 @@ import {
 } from './gl';
 import { LiveStore, MutationBus, type LayerMeta } from './live';
 import { TileCache, WsTileSource, TileLoader } from './tile';
-import type { FlatElement, ShapeElement, TileJSON } from './tile/tile-schema';
+import type {
+  FlatElement,
+  FlatTile,
+  PackedShapeBatch,
+  PackedTile,
+  ShapeElement,
+  TileJSON,
+} from './tile/tile-schema';
 import type { RGBA, TileCoord } from './types';
 
 export interface SceneOptions {
@@ -59,7 +67,7 @@ export interface SceneOptions {
   tileMargin?: (z: number) => number;
 }
 
-const DEFAULT_BG: RGBA = [0.07, 0.08, 0.09, 1];
+const DEFAULT_BG: RGBA = BACKGROUND;
 
 /** Top-level scene composing camera, tiles, and the WebGL renderer. */
 export class Scene {
@@ -96,6 +104,7 @@ export class Scene {
    *  buildMVP — used to sort translucent prisms by true camera distance. */
   private camHeight = 1;
   private _dirty = true;
+  private _colorEpoch = 0;
 
   // --- Per-frame cache: avoids redundant zoomLayers / visibleTiles between
   // refreshTileRequests() and draw() in the same frame. ----
@@ -196,6 +205,9 @@ export class Scene {
   /** Force a redraw on the next frame. */
   markDirty(): void {
     this._dirty = true;
+    // Content change: packed tiles re-read their fills on the next draw. Every
+    // other path that can alter a colour replaces the tile outright.
+    this._colorEpoch++;
   }
 
   /** Read-and-clear the dirty flag. */
@@ -486,7 +498,42 @@ export class Scene {
           continue;
         }
       }
-      for (const el of flat.elements) {
+      // Bulk of a dense tile: blit the pre-packed instance records and only add
+      // the camera offset, instead of walking element objects and re-deriving
+      // every field. Whatever could not be packed falls through to the loop.
+      let packed = flat.packed;
+      if (packed === undefined) packed = flat.packed = this.packTile(flat);
+      let list: readonly FlatElement[] = flat.elements;
+      if (packed) {
+        if (packed.epoch !== this._colorEpoch) {
+          packed.epoch = this._colorEpoch;
+          refreshPacked(packed);
+        }
+        const dx = packed.ox - cx;
+        const dy = packed.oy - cy;
+        if (packed.flat) {
+          ensureFlat(packed.flat.count);
+          flatCount = blitPacked(flatArr, flatCount, packed.flat, dx, dy);
+        }
+        if (packed.flatHex) {
+          ensureFlatHex(packed.flatHex.count);
+          flatHexCount = blitPacked(flatHexArr, flatHexCount, packed.flatHex, dx, dy);
+        }
+        if (packed.box) {
+          ensureBox(packed.box.count);
+          boxCount = blitPacked(boxArr, boxCount, packed.box, dx, dy);
+        }
+        if (packed.cyl) {
+          ensureCyl(packed.cyl.count);
+          cylCount = blitPacked(cylArr, cylCount, packed.cyl, dx, dy);
+        }
+        if (packed.hex) {
+          ensureHex(packed.hex.count);
+          hexCount = blitPacked(hexArr, hexCount, packed.hex, dx, dy);
+        }
+        list = packed.rest;
+      }
+      for (const el of list) {
         if (el.type === 'shape') {
           const isRect = el.shape === 'rect';
           const isHex = el.shape === 'hexagon';
@@ -573,7 +620,7 @@ export class Scene {
             const floatPx = el.size * this.dpr;
             const sizePx = bucketTextSize(Math.max(10, Math.min(96, Math.round(floatPx))));
             const color = el.color ?? ([1, 1, 1, 1] as RGBA);
-            const tex = this.textures.getText(el.text, sizePx, color, el.font);
+            const tex = this.textures.getText(el.text, sizePx, color, el.font, el.tracking, el.halo);
             // Convert screen pixels back to world units at the *live* camera
             // scale (not the tile layer's native scale). The floating texture
             // is already generated at a fixed screen size regardless of zoom,
@@ -606,7 +653,7 @@ export class Scene {
           // texture's pixel dimensions.
           const sizePx = bucketTextSize(Math.max(10, Math.min(96, Math.round(screenPx))));
           const color = el.color ?? ([1, 1, 1, 1] as RGBA);
-          const tex = this.textures.getText(el.text, sizePx, color, el.font);
+          const tex = this.textures.getText(el.text, sizePx, color, el.font, el.tracking, el.halo);
           // Map texture to world rect of width texWidth / sizePx * el.size.
           const worldW = (tex.width / sizePx) * el.size;
           const worldH = (tex.height / sizePx) * el.size;
@@ -643,13 +690,14 @@ export class Scene {
           // Stroke pass: tessellate each ring as a ribbon of quads.
           if (el.stroke && el.strokeWidth) {
             const [sr, sg, sb, sa] = el.stroke;
+            const sw = el.strokeScreen ? el.strokeWidth / this.camera.scale : el.strokeWidth;
             for (const ring of el.rings) {
               const n = ring.length >> 1;
               // Rings are implicitly closed (first vertex connects to last).
               const verts = strokeVertexCount(n, true);
               if (verts > 0) {
                 ensureVector(verts * VECTOR_STRIDE);
-                vectorOffset = tessellateStroke(ring, el.strokeWidth, vectorArr, vectorOffset, cx, cy, sr, sg, sb, sa, true);
+                vectorOffset = tessellateStroke(ring, sw, vectorArr, vectorOffset, cx, cy, sr, sg, sb, sa, true);
               }
             }
           }
@@ -739,6 +787,55 @@ export class Scene {
   }
 
   private static readonly DEFAULT_FILL: RGBA = [0.5, 0.5, 0.5, 1];
+
+  /**
+   * Pack a tile's plain shapes into per-batch instance records once, positioned
+   * relative to the tile origin. Per frame only the camera offset and the live
+   * fill are applied, which turns a dense tile from a walk over element objects
+   * into a typed-array copy. Returns null for tiles too small to pay for the
+   * extra arrays.
+   */
+  private packTile(flat: FlatTile): PackedTile | null {
+    const els = flat.elements;
+    const counts = { flat: 0, flatHex: 0, box: 0, cyl: 0, hex: 0 };
+    let total = 0;
+    for (let i = 0; i < els.length; i++) {
+      const el = els[i];
+      if (!isPackable(el)) continue;
+      counts[batchOf(el)]++;
+      total++;
+    }
+    if (total < PACK_MIN_SHAPES) return null;
+
+    const span = 1 / Math.pow(2, flat.z);
+    const make = (n: number): PackedShapeBatch | null =>
+      n === 0 ? null : { data: new Float32Array(n * COLORED_STRIDE), fills: new Array<RGBA>(n), count: 0 };
+    const packed: PackedTile = {
+      ox: flat.x * span,
+      oy: flat.y * span,
+      epoch: this._colorEpoch,
+      flat: make(counts.flat),
+      flatHex: make(counts.flatHex),
+      box: make(counts.box),
+      cyl: make(counts.cyl),
+      hex: make(counts.hex),
+      rest: [],
+    };
+    for (let i = 0; i < els.length; i++) {
+      const el = els[i];
+      if (!isPackable(el)) {
+        packed.rest.push(el);
+        continue;
+      }
+      const b = packed[batchOf(el)]!;
+      // Packing against the tile origin keeps the stored floats small, so the
+      // float32 narrowing stays as accurate as the camera-relative subtract.
+      this.writeColored(b.data, b.count, el, packed.ox, packed.oy);
+      b.fills[b.count] = el.fill ?? Scene.DEFAULT_FILL;
+      b.count++;
+    }
+    return packed;
+  }
 
   private writeColored(buf: Float32Array, idx: number, el: FlatElement & { type: 'shape' }, cx: number, cy: number): void {
     const o = idx * COLORED_STRIDE;
@@ -857,6 +954,72 @@ export class Scene {
     }
     this._dirty = false;
   }
+}
+
+type ShapeBatchKind = 'flat' | 'flatHex' | 'box' | 'cyl' | 'hex';
+
+/** Below this a tile is too small for the packed arrays to pay for themselves. */
+const PACK_MIN_SHAPES = 64;
+
+/** Shapes whose instance record is fixed once the tile is built. Screen-space
+ *  strokes and insets are re-derived from the live camera every frame. */
+function isPackable(el: FlatElement): el is ShapeElement {
+  return el.type === 'shape' && !(el.stroke && el.strokeWidth) && !el.insetScreen;
+}
+
+/** The geometry bucket a shape draws with — mirrors the dispatch in drawTileLayer. */
+function batchOf(el: ShapeElement): ShapeBatchKind {
+  const has3D = (el.height ?? 0) > 0;
+  if (el.shape === 'hexagon') return has3D ? 'hex' : 'flatHex';
+  if (!has3D) return 'flat';
+  return el.shape === 'rect' ? 'box' : 'cyl';
+}
+
+/** Re-read every instance's live fill into the packed records. Chasing tens of
+ *  thousands of separate RGBA arrays is the most expensive thing in a dense
+ *  frame, so this only runs when the data model reports a content change —
+ *  camera-driven frames reuse the colours already packed. */
+function refreshPacked(p: PackedTile): void {
+  if (p.flat) refreshFills(p.flat);
+  if (p.flatHex) refreshFills(p.flatHex);
+  if (p.box) refreshFills(p.box);
+  if (p.cyl) refreshFills(p.cyl);
+  if (p.hex) refreshFills(p.hex);
+}
+
+function refreshFills(b: PackedShapeBatch): void {
+  const data = b.data;
+  const fills = b.fills;
+  const n = b.count;
+  let o = 4;
+  for (let i = 0; i < n; i++) {
+    const f = fills[i];
+    data[o] = f[0];
+    data[o + 1] = f[1];
+    data[o + 2] = f[2];
+    data[o + 3] = f[3];
+    o += COLORED_STRIDE;
+  }
+}
+
+/** Copy a packed batch into the frame's instance buffer, shifting it to
+ *  camera-relative coords. */
+function blitPacked(
+  dst: Float32Array,
+  at: number,
+  b: PackedShapeBatch,
+  dx: number,
+  dy: number,
+): number {
+  const base = at * COLORED_STRIDE;
+  dst.set(b.data, base);
+  let o = base;
+  for (let i = 0; i < b.count; i++) {
+    dst[o] += dx;
+    dst[o + 1] += dy;
+    o += COLORED_STRIDE;
+  }
+  return at + b.count;
 }
 
 // --- 3D extruded-polygon tessellation (workload prisms) --------------------

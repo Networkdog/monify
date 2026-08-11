@@ -14,6 +14,10 @@ import { TILE_SIZE } from '../../core/constants';
 import type { RGBA } from '../../core/types';
 import type { TooltipData } from '../tooltip';
 import {
+  BACKGROUND,
+  GLYPH_DARK,
+  GLYPH_LIGHT,
+  NEUTRAL,
   sequential,
   categorical,
   type SequentialName,
@@ -57,7 +61,7 @@ export interface TreeMapOptions {
 }
 
 const WORLD = { x0: 0, y0: 0, x1: 1, y1: 1 };
-const DEFAULT_BG: RGBA = [0.06, 0.07, 0.09, 1];
+const DEFAULT_BG: RGBA = BACKGROUND;
 const EXPAND_PX = 300;
 const LABEL_MIN_PX = 46;
 /** Max 3-D extrusion in screen px (constant at any zoom) for heightMetric=1. */
@@ -86,7 +90,7 @@ function hashId(id: string): number {
 /** Pick a readable label color for a given background. */
 function textColor(bg: RGBA): RGBA {
   const lum = 0.2126 * bg[0] + 0.7152 * bg[1] + 0.0722 * bg[2];
-  return lum < 0.5 ? [0.96, 0.97, 1, 1] : [0.08, 0.09, 0.12, 1];
+  return lum < 0.5 ? GLYPH_LIGHT : GLYPH_DARK;
 }
 
 function formatNum(v: number): string {
@@ -118,7 +122,7 @@ export class TreeMap extends VizBase {
     });
     this.headerColor = textColor(opts.background ?? DEFAULT_BG);
     this.colorBy = opts.colorBy ?? 'value';
-    this.paletteName = opts.palette ?? (this.colorBy === 'category' ? 'tableau10' : 'viridis');
+    this.paletteName = opts.palette ?? (this.colorBy === 'category' ? 'aurora' : 'viridis');
     this.tweenRate = opts.tweenRate ?? 6;
     this.heightMetric = opts.heightMetric;
     if (this.colorBy === 'category') {
@@ -255,7 +259,7 @@ export class TreeMap extends VizBase {
     if (this.colorBy === 'category' && this.catScale) {
       return this.catScale(n.category ?? hashId(n.id));
     }
-    return this.seqScale ? this.seqScale(n.current) : [0.5, 0.5, 0.5, 1];
+    return this.seqScale ? this.seqScale(n.current) : NEUTRAL;
   };
 
   private relayout(): void {

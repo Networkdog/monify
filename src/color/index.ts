@@ -17,6 +17,8 @@ export {
 export {
   hexToRgba,
   interpolateRgb,
+  oklchToRgba,
+  rgbaToOklch,
   resolveColor,
   sampleStops,
   sequential,
@@ -26,3 +28,15 @@ export {
   type ColorInput,
   type ColorScale,
 } from './scales';
+export {
+  SURFACE,
+  INK,
+  STATUS,
+  BACKGROUND,
+  NEUTRAL,
+  NEUTRAL_LIGHT,
+  HAIRLINE,
+  HOT,
+  GLYPH_DARK,
+  GLYPH_LIGHT,
+} from './tokens';

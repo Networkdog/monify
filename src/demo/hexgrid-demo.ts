@@ -56,8 +56,8 @@ function buildWorkloads(rng: () => number): { inputs: WorkloadInput[]; sims: Wor
 }
 
 function buildLegend(el: HTMLElement): void {
-  // rdylgn stops run red→green; reverse for a healthy→critical ramp.
-  const stops = DIVERGING.rdylgn.slice().reverse().join(', ');
+  // `status` stops run critical→healthy; reverse for a healthy→critical ramp.
+  const stops = DIVERGING.status.slice().reverse().join(', ');
   el.innerHTML =
     `<div style="font-weight:600;margin-bottom:4px">criticality</div>` +
     `<div style="height:10px;border-radius:3px;background:linear-gradient(90deg, ${stops})"></div>` +

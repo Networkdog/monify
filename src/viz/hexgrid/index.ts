@@ -5,6 +5,8 @@ export {
   type WorkloadInput,
   type HexResourceInput,
   type WorkloadSummary,
+  type ResourceLink,
+  type LinkStyle,
 } from './hexgrid-viz';
 export {
   axialToPixel,
@@ -23,8 +25,16 @@ export {
 export {
   HexPlacer,
   placeHierarchical,
+  placeRelational,
+  placementKey,
+  serializePlacement,
+  restorePlacement,
   hashString,
+  PLACEMENT_VERSION,
   type PlacedWorkload,
   type GroupedItem,
   type HierItem,
+  type RelItem,
+  type RelationalOptions,
+  type PlacementSnapshot,
 } from './placement';

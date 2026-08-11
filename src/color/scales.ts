@@ -40,6 +40,85 @@ export function interpolateRgb(a: RGBA, b: RGBA, t: number): RGBA {
   return [a[0] * u + b[0] * t, a[1] * u + b[1] * t, a[2] * u + b[2] * t, a[3] * u + b[3] * t];
 }
 
+/** Oklab → linear sRGB (Björn Ottosson's matrices). */
+function oklabToLinearSrgb(L: number, a: number, b: number): [number, number, number] {
+  const l_ = L + 0.3963377774 * a + 0.2158037573 * b;
+  const m_ = L - 0.1055613458 * a - 0.0638541728 * b;
+  const s_ = L - 0.0894841775 * a - 1.291485548 * b;
+  const l = l_ * l_ * l_;
+  const m = m_ * m_ * m_;
+  const s = s_ * s_ * s_;
+  return [
+    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+    -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+    -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s,
+  ];
+}
+
+function encodeSrgb(v: number): number {
+  return v <= 0.0031308 ? 12.92 * v : 1.055 * v ** (1 / 2.4) - 0.055;
+}
+
+function decodeSrgb(v: number): number {
+  return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+}
+
+/** Engine RGBA → OKLCH `[lightness, chroma, hue°]`. Inverse of `oklchToRgba`. */
+export function rgbaToOklch(color: RGBA): [number, number, number] {
+  const r = decodeSrgb(color[0]);
+  const g = decodeSrgb(color[1]);
+  const b = decodeSrgb(color[2]);
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+  const lightness = 0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s;
+  const a = 1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s;
+  const bb = 0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s;
+  const hue = (Math.atan2(bb, a) * 180) / Math.PI;
+  return [lightness, Math.hypot(a, bb), hue < 0 ? hue + 360 : hue];
+}
+
+function inGamut([r, g, b]: [number, number, number]): boolean {
+  return r >= -1e-4 && r <= 1 + 1e-4 && g >= -1e-4 && g <= 1 + 1e-4 && b >= -1e-4 && b <= 1 + 1e-4;
+}
+
+/**
+ * OKLCH → engine RGBA, the color space CSS Color 4 and every recent design
+ * system state their palettes in. Lightness and chroma are perceptual there, so
+ * holding them fixed while rotating the hue gives colors that all read as
+ * equally strong — which HSL, where yellow comes out far brighter than blue at
+ * the same `l`, does not.
+ *
+ * Chroma is reduced (hue and lightness preserved) until the color fits in sRGB,
+ * the standard gamut-mapping fallback, rather than clipping channels — clipping
+ * would swing the hue on exactly the vivid colors that need it most.
+ *
+ * @param lightness Perceptual lightness, 0..1.
+ * @param chroma    Colorfulness; ~0.37 is the most sRGB can hold anywhere.
+ * @param hue       Hue angle in degrees.
+ */
+export function oklchToRgba(lightness: number, chroma: number, hue: number, alpha = 1): RGBA {
+  const rad = (hue * Math.PI) / 180;
+  const ca = Math.cos(rad);
+  const sa = Math.sin(rad);
+  let lo = 0;
+  let hi = chroma;
+  let rgb = oklabToLinearSrgb(lightness, chroma * ca, chroma * sa);
+  if (!inGamut(rgb)) {
+    for (let i = 0; i < 16; i++) {
+      const mid = (lo + hi) / 2;
+      const probe = oklabToLinearSrgb(lightness, mid * ca, mid * sa);
+      if (inGamut(probe)) {
+        lo = mid;
+        rgb = probe;
+      } else {
+        hi = mid;
+      }
+    }
+  }
+  return [clamp01(encodeSrgb(rgb[0])), clamp01(encodeSrgb(rgb[1])), clamp01(encodeSrgb(rgb[2])), alpha];
+}
+
 /** Resolve a flexible color input into engine RGBA. */
 export function resolveColor(input: ColorInput, alpha = 1): RGBA {
   if (typeof input === 'string') return hexToRgba(input, alpha);

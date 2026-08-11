@@ -115,10 +115,11 @@ export class TileLoader {
     if (this.opts.source) {
       const src = this.opts.source;
       try {
+        // Timed together: flattening is part of the same synchronous stall.
         const t0 = perfTrace.enabled ? performance.now() : 0;
         const json = src(c.z, c.x, c.y);
-        if (perfTrace.enabled) perfTrace.tileGenerated(performance.now() - t0);
         const flat = flattenTile(json);
+        if (perfTrace.enabled) perfTrace.tileGenerated(performance.now() - t0);
         this.cache.set(c.z, c.x, c.y, { status: 'ready', tile: flat });
       } catch (err) {
         this.cache.set(c.z, c.x, c.y, { status: 'error', error: err as Error });

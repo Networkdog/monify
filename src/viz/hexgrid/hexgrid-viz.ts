@@ -1,18 +1,39 @@
 // HexGrid — a honeycomb workload monitor.
 //
 // Each workload occupies one or more hexagonal cells at a name-determined
-// position (see placement.ts). Cell color encodes criticality (RdYlGn: green =
-// healthy → red = critical); an active anomaly makes a workload pulse. Zooming
-// crosses into the next semantic layer every few zoom levels, replacing each
-// cell with a finer honeycomb that fills it (self-similar), while metric
-// changes animate the colors smoothly in real time.
+// position (see placement.ts). Cell color encodes criticality (the `status`
+// ramp: deep emerald = healthy → vivid rose = critical); an active anomaly makes
+// a workload pulse. Zooming crosses into the next semantic layer every few zoom
+// levels, replacing each cell with a finer honeycomb that fills it
+// (self-similar), while metric changes animate the colors smoothly in real time.
 
 import { VizBase } from '../viz-base';
-import type { TileJSON, TileElement } from '../../core/tile';
+import type { TileJSON, TileElement, ShapeElement, VectorElement } from '../../core/tile';
 import { TILE_SIZE } from '../../core/constants';
 import type { RGBA } from '../../core/types';
 import type { TooltipData } from '../tooltip';
-import { paletteStops, sampleStops, interpolateRgb } from '../../color';
+import {
+  BACKGROUND,
+  HAIRLINE,
+  HOT,
+  INK,
+  NEUTRAL,
+  NEUTRAL_LIGHT,
+  categorical,
+  hexToRgba,
+  interpolateRgb,
+  paletteStops,
+  sampleStops,
+} from '../../color';
+import {
+  fitLabel,
+  labelCapacity,
+  labelColorFor,
+  labelWorldSize,
+  LABEL_FONT,
+  LABEL_MIN_CELL_PX,
+  LABEL_TRACKING,
+} from './label';
 import {
   axialToPixel,
   pixelToAxial,
@@ -22,14 +43,49 @@ import {
   spiralRadiusFor,
   type Axial,
 } from './hex';
-import { HexPlacer, placeHierarchical, placeDense, placeAffinity, type HierItem, type PlacedWorkload } from './placement';
+import {
+  HexPlacer,
+  hashString,
+  placeHierarchical,
+  placeDense,
+  placeAffinity,
+  placeRelational,
+  placementKey,
+  restorePlacement,
+  serializePlacement,
+  type HierItem,
+  type PlacedWorkload,
+  type PlacementSnapshot,
+  type RelItem,
+} from './placement';
+import { placeForce } from './force-layout';
 import type { EntityUpdate, MonitorTarget } from '../../data/types';
-
 export interface HexResourceInput {
   id: string;
   kind?: string;
   /** Severity 0..1 (0 = healthy, 1 = critical). */
   value: number;
+}
+
+/**
+ * One link to another resource: a bare name when every relationship looks the
+ * same, or `{ id, kind }` to have that link drawn in its kind's own style — a
+ * VNet peering, a disk attachment and a private endpoint are not the same fact
+ * about the estate, and the wires say so (see `HexGridOptions.linkStyles`).
+ */
+export type ResourceLink = string | { id: string; kind?: string };
+
+/** How links of one kind are drawn. */
+export interface LinkStyle {
+  /** Wire colour; its alpha is the wire's opacity. */
+  color: RGBA;
+  /** Multiplier on the base wire thickness. Default 1. */
+  width?: number;
+}
+
+/** Resolve a link to the name it points at. */
+function linkId(l: ResourceLink): string {
+  return typeof l === 'string' ? l : l.id;
 }
 
 export interface WorkloadInput {
@@ -40,6 +96,8 @@ export interface WorkloadInput {
   size?: number;
   /** Criticality 0..1 (0 = healthy, 1 = critical). */
   criticality: number;
+  /** False for resources no health is reported for (pure config: VNet, NIC, NSG, disk …) — drawn neutral and ignored by aggregate status. Default true. */
+  monitored?: boolean;
   resources?: HexResourceInput[];
   meta?: Record<string, unknown>;
   /** Locality key: workloads sharing a group form one contiguous blob (with `placement: 'grouped'`). */
@@ -48,6 +106,12 @@ export interface WorkloadInput {
   groupPath?: string[];
   /** "Shared-ness" 0..1 for `placement: 'affinity'`: higher values (e.g. network) are pulled toward the centre of their cluster. */
   central?: number;
+  /** Names of related resources for `placement: 'relational'` — the magnetic links that arrange a cluster's contents. Tag a link with a `kind` to have it drawn in that kind's style. */
+  deps?: ResourceLink[];
+  /** Non-containment attributes (e.g. [region, workload]) whose siblings attract, for `placement: 'relational'`. */
+  affinity?: string[];
+  /** A key shared with the clusters this one should gather near — the Virtual WAN hub a subscription peers with, for `placement: 'force'`. */
+  anchor?: string;
   /** Short glyph/code drawn inside the cell once it is large enough on screen (an in-cell "icon"). */
   label?: string;
   /** Categorical tint used when the grid's color mode is 'category'. */
@@ -63,18 +127,38 @@ export interface HexGridOptions {
   tweenRate?: number;
   /** Max integer tile zoom. Default 26. */
   maxZoom?: number;
-  /** Placement strategy: 'hash' (default) scatters by name; 'grouped' clusters by `group`; 'hierarchical' packs by `groupPath` as bounding circles with gaps; 'dense' grows a gap-free territory map by `groupPath`; 'affinity' relaxes territories with a force-directed affinity model into an organic map. */
-  placement?: 'hash' | 'grouped' | 'hierarchical' | 'dense' | 'affinity';
-  /** Attraction weight per `groupPath` attribute position (leaf excluded) for 'affinity' placement. */
+  /** Placement strategy: 'hash' (default) scatters by name; 'grouped' clusters by `group`; 'hierarchical' packs by `groupPath` as bounding circles with gaps; 'dense' grows a gap-free territory map by `groupPath`; 'affinity' relaxes territories with a force-directed affinity model into an organic map; 'relational' nests `groupPath` as walled clusters and arranges each one by its `deps` links; 'force' settles the whole containment tree under graded cohesion, dependency and hub forces. */
+  placement?: 'hash' | 'grouped' | 'hierarchical' | 'dense' | 'affinity' | 'relational' | 'force';
+  /** Attraction weight per `groupPath` attribute position (leaf excluded) for 'affinity' placement, or per `affinity` slot for 'relational'. */
   affinityWeights?: number[];
+  /** Cohesion per containment depth (coarsest first) for 'force': how hard each level holds its children together. */
+  cohesion?: number[];
+  /** Pull between clusters that depend on each other ('force'). */
+  linkK?: number;
+  /** Pull between clusters sharing an `anchor` — the same hub ('force'). */
+  anchorK?: number;
+  /** Empty-cell gap ringing a cluster at each `groupPath` depth (coarsest first) for 'relational' placement. */
+  moats?: number[];
+  /** A layout baked earlier: reused when it still matches the inputs, ignored otherwise. Laying out a large estate costs seconds, and reusing it also keeps the map still as resources come and go. */
+  layout?: PlacementSnapshot | null;
+  /** Handed a freshly computed layout so the app can persist it. */
+  onLayout?: (snap: PlacementSnapshot) => void;
   /** Gap (empty cells) between groups diverging at each `groupPath` level, coarsest first. Used by 'hierarchical'. */
   groupPads?: number[];
   /** Target footprint aspect ratio (width:height) for 'hierarchical'/'dense' placement. Default 16/9. */
   aspect?: number;
   /** Camera zoom at which the first finer sub-layer appears (semantic-zoom swap). Default 6. */
   firstLayerZoom?: number;
-  /** Initial color mode: 'health' (live RdYlGn) or 'category' (static tint map). Default 'health'. */
+  /** Fold each subscription into one glyph when zoomed out past the cell layer. Default true. */
+  aggregate?: boolean;
+  /** Initial color mode: 'health' (live status ramp) or 'category' (static tint map). Default 'health'. */
   colorMode?: 'health' | 'category';
+  /** Show what belongs with what once cells read individually: a shared bed under each cluster, then wires along the `deps` links. Default true. */
+  relations?: boolean;
+  /** Hover focus: dim everything but the cell under the pointer, what it is wired to, and the wires between them. Default false — with it on, every cell the pointer crosses redraws the map. */
+  focusMode?: boolean;
+  /** Colour and thickness per `deps` kind. Kinds with no entry fall back to a plain hairline. */
+  linkStyles?: Record<string, LinkStyle>;
 }
 
 export interface WorkloadSummary {
@@ -105,10 +189,54 @@ interface LiveWorkload {
    *  changes mutate this array in place (+markDirty) instead of rebuilding the
    *  whole estate's tiles every update. Alpha is fixed once at build time. */
   fillRGBA: RGBA;
+  /** Layer-0 body element, built once and shared by every tile and zoom level
+   *  showing this cell. A zoom-level change re-emits every visible cell, so one
+   *  fresh element per cell per rebuild is what turns that into a stall. */
+  body?: ShapeElement | VectorElement;
   label?: string;
   tint: RGBA;
   tooltip?: string[];
   resources: LiveResource[];
+  /** Containment path (coarse→fine) used to bucket cells into zoom-out aggregates. */
+  groupPath?: string[];
+  /** False when no health is reported for this resource (see WorkloadInput.monitored). */
+  monitored: boolean;
+  /** Position in `workloads` — a link is drawn by its lower-indexed end only. */
+  index: number;
+  /** Resources this one is wired to — `deps` resolved to both ends of each link. */
+  links?: { to: LiveWorkload; kind?: string }[];
+  /** Bed colour shared by every cell of the same finest containment cluster. */
+  bedColor?: RGBA;
+  /** Cached bed hexagons, faded-out cells and link wires. Like `body`, built on
+   *  the first close-up draw and then shared by every tile and zoom level. */
+  bed?: ShapeElement[];
+  dim?: ShapeElement[];
+  /** Fill behind `dim`: this cell's own colour faded toward the background. */
+  dimRGBA?: RGBA;
+  wires?: VectorElement[];
+  wiresFaint?: VectorElement[];
+}
+
+/**
+ * A zoom-out aggregate: one subscription's worth of cells collapsed to a single
+ * hexagon glyph. Drawn as an instanced `shape` (O(1) repack) — not a tessellated
+ * polygon — so the far overview costs a few hundred instances instead of tens of
+ * thousands of cells. Its colour is the members' worst-case health, recoloured
+ * in place so a live update needs no tile rebuild.
+ */
+interface Aggregate {
+  center: [number, number];
+  radius: number;
+  bbox: { minx: number; miny: number; maxx: number; maxy: number };
+  members: LiveWorkload[];
+  count: number;
+  label: string;
+  worstCrit: number;
+  /** True when at least one member reports health at all. */
+  monitored: boolean;
+  fillRGBA: RGBA;
+  /** Static categorical tint (category colour mode). */
+  tint: RGBA;
 }
 
 const FIT_SPAN = 0.9;
@@ -122,7 +250,6 @@ const FIT_SPAN = 0.9;
 const LAYER_SPAN = 5;
 const LAYER_SUBDIV = 2 ** LAYER_SPAN;
 const DEFAULT_FIRST_LAYER_Z = 6;
-const LABEL_PX = 54;
 const PULSE_HALFLIFE = 1.6;
 // 3D extrusion: each workload cell becomes a hex prism whose height (in units
 // of the hex radius) encodes criticality — healthy = thin tile, critical = tall
@@ -143,7 +270,58 @@ const GAP_FRAC = 0.08;
 // Fraction of its radius each sub-layer cell is drawn at, leaving a gap between
 // adjacent cells. Reused as the coarser-layer core radius when nesting gaps.
 const SUB_FILL = 0.94;
-const HOT: RGBA = [1, 0.96, 0.75, 1];
+// Resources Azure Resource Health reports nothing about (VNet, NIC, NSG, disk,
+// private endpoint …) still shape the map — they are the scaffolding everything
+// else attaches to — so they are drawn in a muted neutral rather than being
+// coloured as if they were healthy.
+const UNMONITORED: RGBA = NEUTRAL;
+// Relationship cues, switched on as the cells grow big enough to be read one by
+// one. The bed is a full-size hexagon under each cell tinted by its cluster, so
+// a resource group's cells sit on one continuous slab with the moat around it
+// left as background; the wires trace the `deps` links that arranged those cells
+// in the first place (a NIC to its VM, a private endpoint to the database it
+// fronts). Beds come first — one extra instance per cell — and the wires follow
+// a couple of zoom levels later, where few enough are on screen to stay legible.
+const BED_MIN_CELL_PX = 16;
+// Wires arrive in two steps. From WIRE_MIN_CELL_PX every link is a
+// screen-constant hairline — thin and faint enough that a whole estate's wiring
+// reads as texture rather than noise — and from WIRE_FULL_CELL_PX the wires
+// thicken with the cells and take their kind's full colour.
+const WIRE_MIN_CELL_PX = 6;
+const WIRE_FULL_CELL_PX = 40;
+/** Hairline width (screen px), and the share of a kind's opacity it keeps. */
+const WIRE_FAINT_PX = 1;
+const WIRE_FAINT_ALPHA = 0.5;
+/** How far a bed is tinted from the background toward its cluster's hue. */
+const BED_MIX = 0.28;
+const BED_HUE = categorical('aurora');
+/** Bed tint used while the cells carry a categorical colour of their own: a
+ *  plain slate, so the bed still marks out the cluster without arguing with the
+ *  hues on top of it. */
+const BED_NEUTRAL: RGBA = NEUTRAL_LIGHT;
+const WIRE_COLOR: RGBA = HAIRLINE;
+/** Base wire thickness (cell radii) for an unstyled link, and the clearance
+ *  kept at each end. A kind's `width` multiplies the thickness. */
+const WIRE_WIDTH = 0.06;
+const WIRE_TRIM = 0.55;
+/** Beyond this span (cell pitches) a link is drawn as two halves, one from each
+ *  end. A spoke VNet's peering to its region's Virtual WAN hub crosses the map,
+ *  and whichever end you are looking at, the other one is far outside the loaded
+ *  tiles — so each end draws its own half, which also keeps the halves from
+ *  overlapping and doubling the opacity where they meet. */
+const WIRE_SPLIT_SPAN = 3.5;
+/** The hovered cell's wires keep their kind's colour but go fully opaque and
+ *  this much thicker, so they read as "these are the links you asked for". */
+const FOCUS_WIRE_GAIN = 1.7;
+/** While a cell is hovered, every unrelated cell keeps this much of its own
+ *  colour and fades the rest of the way into the background, so only that cell,
+ *  what it is wired to, and the wires between them stand out. */
+const DIM_MIX = 0.18;
+/** Ring drawn behind the hovered cell (cell radii) to anchor the focus. */
+const FOCUS_RING = 1.12;
+const FOCUS_RING_COLOR: RGBA = hexToRgba(INK.accent);
+const DEFAULT_BG: RGBA = BACKGROUND;
+const NO_WIRES: VectorElement[] = [];
 const SQRT3 = Math.sqrt(3);
 
 function clamp01(v: number): number {
@@ -208,6 +386,54 @@ function resolvePlacement(opts: HexGridOptions): Map<string, PlacedWorkload> {
     const list = placeAffinity(hierItems(), { attrWeights: opts.affinityWeights });
     return new Map(list.map((p) => [p.name, p]));
   }
+  if (opts.placement === 'force') {
+    const rel: RelItem[] = opts.workloads.map((w) => ({
+      name: w.name,
+      size: w.size ?? 1,
+      path: w.groupPath ?? (w.group ? [w.group] : [w.name]),
+      deps: w.deps?.map(linkId),
+      central: w.central,
+      affinity: w.anchor ? [w.anchor] : undefined,
+    }));
+    const key = placementKey(rel, { moats: opts.moats }, 'force');
+    const cached = restorePlacement(opts.layout, rel, key);
+    const list =
+      cached ??
+      placeForce(
+        opts.workloads.map((w) => ({
+          name: w.name,
+          size: w.size ?? 1,
+          path: w.groupPath ?? (w.group ? [w.group] : [w.name]),
+          deps: w.deps?.map(linkId),
+          central: w.central,
+          anchor: w.anchor,
+        })),
+        {
+          cohesion: opts.cohesion,
+          linkK: opts.linkK,
+          anchorK: opts.anchorK,
+          moats: opts.moats,
+        },
+      );
+    if (cached === null) opts.onLayout?.(serializePlacement(list, key));
+    return new Map(list.map((p) => [p.name, p]));
+  }
+  if (opts.placement === 'relational') {
+    const rel: RelItem[] = opts.workloads.map((w) => ({
+      name: w.name,
+      size: w.size ?? 1,
+      path: w.groupPath ?? (w.group ? [w.group] : [w.name]),
+      deps: w.deps?.map(linkId),
+      central: w.central,
+      affinity: w.affinity,
+    }));
+    const relOpts = { moats: opts.moats, affinityWeights: opts.affinityWeights };
+    const key = placementKey(rel, relOpts);
+    const cached = restorePlacement(opts.layout, rel, key);
+    const list = cached ?? placeRelational(rel, relOpts);
+    if (cached === null) opts.onLayout?.(serializePlacement(list, key));
+    return new Map(list.map((p) => [p.name, p]));
+  }
   if (opts.placement === 'hierarchical') {
     const list = placeHierarchical(hierItems(), opts.groupPads ?? [3, 1, 0], opts.aspect);
     return new Map(list.map((p) => [p.name, p]));
@@ -239,7 +465,7 @@ export class HexGrid extends VizBase implements MonitorTarget {
   private readonly tweenRate: number;
   private readonly layerBaseZ: number;
   private colorMode: 'health' | 'category';
-  private readonly neutralTint: RGBA = [0.5, 0.55, 0.62, 1];
+  private readonly neutralTint: RGBA = NEUTRAL_LIGHT;
 
   private fitScale = 1;
   private cxb = 0;
@@ -258,18 +484,45 @@ export class HexGrid extends VizBase implements MonitorTarget {
   // only at the overview, where every visible cell repaints at once.
   private fitZoom = 0;
   private lastPaint = -1;
+  // Zoom-out aggregates (one hexagon per subscription) plus a lookup from a
+  // cell's subscription prefix to its aggregate, for hover/click at the
+  // overview. Empty when workloads carry no groupPath (aggregation disabled).
+  private aggregates: Aggregate[] = [];
+  private readonly aggByKey = new Map<string, Aggregate>();
+  private aggPrefixLen = 0;
+  private readonly aggEnabled: boolean;
+  // Close-up relationship cues: whether they are on, the clear colour they are
+  // mixed from, one bed colour per containment cluster, the per-kind wire styles
+  // (resolved per tier into `linkStyleCache`), and the hovered cell, whose links
+  // are drawn in full.
+  private relations: boolean;
+  private focusMode: boolean;
+  private readonly bg: RGBA;
+  private readonly bedColors = new Map<string, RGBA>();
+  private readonly linkStyles: Record<string, LinkStyle>;
+  private readonly linkStyleCache = new Map<string, { color: RGBA; width: number }>();
+  private readonly hiddenKinds = new Set<string>();
+  /** The hovered cell together with everything it is wired to — what stays lit
+   *  while the rest of the map fades out. Null when nothing is hovered. */
+  private focusSet: Set<LiveWorkload> | null = null;
+  private focus: LiveWorkload | null = null;
 
   constructor(canvas: HTMLCanvasElement, opts: HexGridOptions) {
     super({
       canvas,
-      background: opts.background ?? [0.05, 0.06, 0.08, 1],
+      background: opts.background ?? DEFAULT_BG,
       minTileZ: 0,
       maxTileZ: opts.maxZoom ?? 26,
     });
     this.tweenRate = opts.tweenRate ?? 5;
-    this.critStops = paletteStops('rdylgn');
+    this.critStops = paletteStops('status');
     this.colorMode = opts.colorMode ?? 'health';
     this.layerBaseZ = (opts.firstLayerZoom ?? DEFAULT_FIRST_LAYER_Z) - LAYER_SPAN;
+    this.aggEnabled = opts.aggregate !== false;
+    this.relations = opts.relations !== false;
+    this.focusMode = opts.focusMode === true;
+    this.linkStyles = opts.linkStyles ?? {};
+    this.bg = opts.background ?? DEFAULT_BG;
 
     // 1) Place every workload on the hex grid. 'grouped' keeps same-group
     // workloads in one contiguous blob (locality); 'hierarchical' additionally
@@ -329,6 +582,7 @@ export class HexGrid extends VizBase implements MonitorTarget {
       }
       const live: LiveWorkload = {
         name: input.name,
+        index: this.workloads.length,
         cells: p.cells,
         worldCells,
         outline: this.insetOutline(this.computeOutline(p.cells), this.worldHexRadius * GAP_FRAC),
@@ -342,6 +596,9 @@ export class HexGrid extends VizBase implements MonitorTarget {
         label: input.label,
         tint: input.tint ?? this.neutralTint,
         tooltip: input.tooltip,
+        groupPath: input.groupPath,
+        bedColor: this.bedColorFor(input.groupPath),
+        monitored: input.monitored !== false,
         resources: (input.resources ?? []).map((res) => ({
           id: res.id,
           kind: res.kind ?? 'resource',
@@ -356,8 +613,12 @@ export class HexGrid extends VizBase implements MonitorTarget {
       for (const [q, r] of p.cells) this.cellToWorkload.set(axialKey(q, r), idx);
     }
 
+    // Resolve the dependency links now that every workload exists.
+    this.buildRelations(placed);
     // Index the placed cells for fast layer-0 tile culling.
     this.buildSpatialIndex();
+    // Pre-compute the zoom-out aggregates (one hexagon per subscription).
+    this.buildAggregates();
 
     // The base ctor's first resize ran before worldW/worldH existed, so re-fit
     // now that the real footprint aspect is known (fit the bbox to the canvas).
@@ -448,6 +709,7 @@ export class HexGrid extends VizBase implements MonitorTarget {
   /** Switch between the live health palette and a static categorical territory map. */
   setColorMode(mode: 'health' | 'category'): void {
     this.colorMode = mode;
+    this.refreshBedColors();
     this.invalidate();
     this.scene.markDirty();
   }
@@ -461,6 +723,52 @@ export class HexGrid extends VizBase implements MonitorTarget {
   setTint(name: string, color: RGBA): void {
     const w = this.byName.get(name);
     if (w) w.tint = color;
+  }
+
+  /** Turn the close-up relationship cues (cluster beds + link wires) on or off. */
+  setRelations(on: boolean): void {
+    if (this.relations === on) return;
+    this.relations = on;
+    this.invalidate();
+    this.scene.markDirty();
+  }
+
+  /** Show or hide every link of one `deps` kind. */
+  setLinkKindVisible(kind: string, visible: boolean): void {
+    if (visible === !this.hiddenKinds.has(kind)) return;
+    if (visible) this.hiddenKinds.delete(kind);
+    else this.hiddenKinds.add(kind);
+    // Wires are baked per cell, so the cached sets have to go with the change.
+    for (const w of this.workloads) {
+      w.wires = undefined;
+      w.wiresFaint = undefined;
+    }
+    this.rebuildFocusSet();
+    this.invalidate();
+    this.scene.markDirty();
+  }
+
+  /** Link kinds currently hidden. */
+  get hiddenLinkKinds(): string[] {
+    return [...this.hiddenKinds];
+  }
+
+  /** Turn hover focus on or off: with it on, hovering a cell fades out
+   *  everything it is not wired to. */
+  setFocusMode(on: boolean): void {
+    if (this.focusMode === on) return;
+    this.focusMode = on;
+    if (!on) this.setFocus(null);
+  }
+
+  /** Whether hover focus is on. */
+  get focusModeOn(): boolean {
+    return this.focusMode;
+  }
+
+  /** Whether the close-up relationship cues are on. */
+  get relationsShown(): boolean {
+    return this.relations;
   }
 
   // ── VizBase hooks ────────────────────────────────────────────────────────────
@@ -524,6 +832,10 @@ export class HexGrid extends VizBase implements MonitorTarget {
     // repaints the live colours with zero tile rebuilds. Deeper sub-layers use
     // procedural per-sub-cell fills (effectively static), so leave them alone.
     if (colorChanged && this.scene.camera.zoom < this.layerBaseZ + LAYER_SPAN) {
+      // When the overview is showing aggregates, refresh their worst-case colour
+      // from the members that just tweened (a few hundred writes) so the
+      // subscription glyphs carry live health too.
+      if (this.aggLevelForZoom(this.scene.camera.zoom) > 0) this.recolorAggregates();
       // At the far overview tens of thousands of cells repaint at once, which
       // can't fit in a single frame — so cap the live-colour repaint rate there
       // to keep the view responsive. Zoomed in (few cells on screen) repaint
@@ -569,7 +881,10 @@ export class HexGrid extends VizBase implements MonitorTarget {
     // Which semantic layer this tile zoom belongs to: 0 is the workload
     // honeycomb, deeper layers are progressively finer sub-cell fills.
     const layer = Math.max(0, Math.floor((z - this.layerBaseZ) / LAYER_SPAN));
-    if (layer === 0) {
+    if (layer === 0 && this.aggLevelForZoom(z) > 0) {
+      // Far overview: one hexagon per subscription instead of every single cell.
+      this.drawAggregates(ox, oy, x1, y1, scale, out);
+    } else if (layer === 0) {
       const cellPx = 2 * this.worldHexRadius * scale;
       this.drawLayer0(ox, oy, x1, y1, cellPx, out);
     } else {
@@ -600,7 +915,12 @@ export class HexGrid extends VizBase implements MonitorTarget {
         for (let bi = 0; bi < bin.length; bi++) {
           const w = this.workloads[bin[bi]];
           if (w.bbox.maxx <= ox || w.bbox.minx >= x1 || w.bbox.maxy <= oy || w.bbox.miny >= y1) continue;
-          this.drawWorkload(w, cellPx, out);
+          // A cell straddling a tile edge is drawn by both tiles — harmless for
+          // its opaque body, but a translucent wire drawn twice would come out
+          // darker, so wires are left to the tile holding the cell's centre.
+          const c = w.worldCenter;
+          const owns = c[0] >= ox && c[0] < x1 && c[1] >= oy && c[1] < y1;
+          this.drawWorkload(w, cellPx, out, owns);
         }
       }
     }
@@ -621,12 +941,218 @@ export class HexGrid extends VizBase implements MonitorTarget {
     this.gridBins = bins;
   }
 
-  protected override hitTest(wx: number, wy: number, _z: number): TooltipData | null {
+  // ── Zoom-out aggregation ────────────────────────────────────────
+
+  /**
+   * Bucket every resource into its subscription (the groupPath minus its finest
+   * level) and collapse each bucket to one Aggregate. Only that level is
+   * aggregated: a coarser worst-case saturates to red — every management group
+   * has *something* broken — and stops saying anything, while a per-subscription
+   * worst-case stays local, so the overview reads as a calm field with faults
+   * where the faults actually are. A no-op when there is no hierarchy to fold.
+   */
+  private buildAggregates(): void {
+    this.aggregates = [];
+    this.aggByKey.clear();
+    if (!this.aggEnabled) {
+      this.aggPrefixLen = 0;
+      return;
+    }
+    let maxLen = 0;
+    for (const w of this.workloads) {
+      if (w.groupPath && w.groupPath.length > maxLen) maxLen = w.groupPath.length;
+    }
+    if (maxLen < 2) {
+      this.aggPrefixLen = 0;
+      return;
+    }
+    const p = maxLen - 1;
+    this.aggPrefixLen = p;
+    const groups = new Map<string, LiveWorkload[]>();
+    for (const w of this.workloads) {
+      const path = w.groupPath;
+      if (!path || path.length < 2) continue;
+      const key = path.slice(0, p).join('\u0001');
+      const g = groups.get(key);
+      if (g) g.push(w);
+      else groups.set(key, [w]);
+    }
+    for (const [key, members] of groups) {
+      let sx = 0;
+      let sy = 0;
+      let count = 0;
+      let minx = Infinity;
+      let miny = Infinity;
+      let maxx = -Infinity;
+      let maxy = -Infinity;
+      for (const w of members) {
+        const n = w.cells.length;
+        sx += w.worldCenter[0] * n;
+        sy += w.worldCenter[1] * n;
+        count += n;
+        if (w.bbox.minx < minx) minx = w.bbox.minx;
+        if (w.bbox.miny < miny) miny = w.bbox.miny;
+        if (w.bbox.maxx > maxx) maxx = w.bbox.maxx;
+        if (w.bbox.maxy > maxy) maxy = w.bbox.maxy;
+      }
+      const cx = count > 0 ? sx / count : 0;
+      const cy = count > 0 ? sy / count : 0;
+      // √area, so the glyph roughly covers the cells it stands in for.
+      const radius = this.worldHexRadius * Math.max(1, Math.sqrt(count)) * 0.9;
+      const path0 = members[0].groupPath as string[];
+      const agg: Aggregate = {
+        center: [cx, cy],
+        radius,
+        bbox: { minx, miny, maxx, maxy },
+        members,
+        count,
+        label: path0[p - 1] ?? path0[path0.length - 1] ?? '',
+        worstCrit: 0,
+        monitored: members.some((m) => m.monitored),
+        fillRGBA: [0.5, 0.5, 0.5, 1],
+        tint: members[0].tint,
+      };
+      this.aggregates.push(agg);
+      this.aggByKey.set(key, agg);
+    }
+    this.recolorAggregates();
+  }
+
+  /** Which aggregate level to draw at tile-zoom `z`: 1 (subscription glyphs)
+   *  below the first cell layer, or -1 (individual cells) at or above it. */
+  private aggLevelForZoom(z: number): number {
+    if (this.aggregates.length === 0 || z >= this.layerBaseZ) return -1;
+    return 1;
+  }
+
+  /** Refresh every aggregate's worst-case health colour from its members, in
+   *  place (RGB only), so a repaint needs no tile rebuild. */
+  private recolorAggregates(): void {
+    for (const a of this.aggregates) {
+      let worst = 0;
+      let pulse = 0;
+      for (const w of a.members) {
+        // Config-only resources report nothing, so they can't set the status.
+        if (!w.monitored) continue;
+        if (w.crit > worst) worst = w.crit;
+        if (w.pulse > pulse) pulse = w.pulse;
+      }
+      a.worstCrit = worst;
+      const base = a.monitored ? this.critColor(worst) : UNMONITORED;
+      const lit = pulse > 0.001 ? this.applyPulse(base, pulse) : base;
+      const f = a.fillRGBA;
+      f[0] = lit[0];
+      f[1] = lit[1];
+      f[2] = lit[2];
+    }
+  }
+
+  /** Draw the subscription aggregates overlapping a tile rect as instanced
+   *  hexagons, labelling them once the glyph is large enough on screen. */
+  private drawAggregates(
+    ox: number,
+    oy: number,
+    x1: number,
+    y1: number,
+    scale: number,
+    out: TileElement[],
+  ): void {
+    const category = this.colorMode === 'category';
+    for (const a of this.aggregates) {
+      if (a.bbox.maxx <= ox || a.bbox.minx >= x1 || a.bbox.maxy <= oy || a.bbox.miny >= y1) continue;
+      out.push({
+        type: 'shape',
+        shape: 'hexagon',
+        x: a.center[0],
+        y: a.center[1],
+        w: 2 * a.radius,
+        h: 2 * a.radius,
+        fill: category ? a.tint : a.fillRGBA,
+        layer: 1,
+        depth: 0,
+      });
+      if (2 * a.radius * scale >= LABEL_MIN_CELL_PX && a.label) {
+        const text = fitLabel(a.label, labelCapacity());
+        if (text) {
+          const fill = category ? a.tint : a.fillRGBA;
+          out.push({
+            type: 'text',
+            x: a.center[0],
+            y: a.center[1],
+            size: labelWorldSize(a.radius),
+            text,
+            color: labelColorFor(fill),
+            font: LABEL_FONT,
+            tracking: LABEL_TRACKING,
+            align: 'center',
+            elevation: 0,
+            layer: 3,
+            depth: 0,
+          });
+        }
+      }
+    }
+  }
+
+  /** The aggregate under a world point: the one owning the cell there, or the
+   *  glyph covering it when the point fell in a gap between cells. */
+  private aggregateAt(wx: number, wy: number): Aggregate | null {
     const w = this.workloadAt(wx, wy);
+    if (w && w.groupPath && w.groupPath.length >= 2) {
+      const a = this.aggByKey.get(w.groupPath.slice(0, this.aggPrefixLen).join('\u0001'));
+      if (a) return a;
+    }
+    let best: Aggregate | null = null;
+    let bestD = Infinity;
+    for (const a of this.aggregates) {
+      const dx = wx - a.center[0];
+      const dy = wy - a.center[1];
+      const d = dx * dx + dy * dy;
+      if (d < a.radius * a.radius && d < bestD) {
+        best = a;
+        bestD = d;
+      }
+    }
+    return best;
+  }
+
+  protected override hitTest(wx: number, wy: number, _z: number): TooltipData | null {
+    if (this.aggLevelForZoom(this.scene.camera.zoom) > 0) {
+      this.setFocus(null);
+      const a = this.aggregateAt(wx, wy);
+      if (!a) return null;
+      const sev = a.worstCrit;
+      const status = !a.monitored
+        ? 'no health reported'
+        : sev > 0.75
+          ? 'critical'
+          : sev > 0.4
+            ? 'warning'
+            : 'healthy';
+      return {
+        title: a.label,
+        body: [
+          `worst status: ${status}${a.monitored ? ` (${(sev * 100).toFixed(0)}%)` : ''}`,
+          `${a.count} resources`,
+          'click to zoom in',
+        ],
+      };
+    }
+    const w = this.workloadAt(wx, wy);
+    // Hovering also picks the cell whose links are drawn in full.
+    this.setFocus(w);
     if (!w) return null;
     const sev = w.crit;
-    const status = sev > 0.75 ? 'critical' : sev > 0.4 ? 'warning' : 'healthy';
-    const body: string[] = [`status: ${status} (${(sev * 100).toFixed(0)}%)`];
+    const status = !w.monitored
+      ? 'no health reported'
+      : sev > 0.75
+        ? 'critical'
+        : sev > 0.4
+          ? 'warning'
+          : 'healthy';
+    const body: string[] = [
+      `status: ${status}${w.monitored ? ` (${(sev * 100).toFixed(0)}%)` : ''}`,
+    ];
     if (w.tooltip) body.push(...w.tooltip);
     if (w.resources.length > 0) {
       const worst = Math.max(...w.resources.map((r) => r.current));
@@ -636,7 +1162,25 @@ export class HexGrid extends VizBase implements MonitorTarget {
     return { title: w.name, body };
   }
 
+  protected override onHoverEnd(): void {
+    this.setFocus(null);
+  }
+
   protected override pick(wx: number, wy: number, _z: number): void {
+    if (this.aggLevelForZoom(this.scene.camera.zoom) > 0) {
+      const a = this.aggregateAt(wx, wy);
+      if (!a) return;
+      const prect = this.canvas.getBoundingClientRect();
+      const targetScale =
+        (0.7 * Math.min(Math.max(1, prect.width), Math.max(1, prect.height))) / (2 * a.radius);
+      // Zoom past the first cell layer so the drill-in actually reveals cells.
+      const zoom = Math.max(
+        this.layerBaseZ,
+        Math.min(this.maxTileZ, Math.log2(targetScale / TILE_SIZE)),
+      );
+      this.flyTo({ x: a.center[0], y: a.center[1], zoom });
+      return;
+    }
     const w = this.workloadAt(wx, wy);
     if (!w) return;
     const rect = this.canvas.getBoundingClientRect();
@@ -762,7 +1306,7 @@ export class HexGrid extends VizBase implements MonitorTarget {
    *  place (RGB only — alpha was fixed at build time), so a repaint needs no new
    *  allocation and, crucially, no tile rebuild. */
   private updateHealthFill(w: LiveWorkload): void {
-    const base = this.critColor(w.crit);
+    const base = this.bodyColor(w);
     const lit = w.pulse > 0.001 ? this.applyPulse(base, w.pulse) : base;
     const f = w.fillRGBA;
     f[0] = lit[0];
@@ -770,12 +1314,11 @@ export class HexGrid extends VizBase implements MonitorTarget {
     f[2] = lit[2];
   }
 
-  /** Fill array for a workload's layer-0 body. In health mode this is the
-   *  workload's persistent fillRGBA (shared with onStep, which recolours it in
-   *  place so live updates never rebuild tiles); in category mode it's a fresh
-   *  static colour, since a territory map doesn't animate. */
-  private fillFor(w: LiveWorkload, lit: RGBA, category: boolean, alpha: number): RGBA {
-    if (category) return [lit[0], lit[1], lit[2], alpha];
+  /** Fill array for a workload's layer-0 body: the workload's persistent
+   *  fillRGBA, shared with onStep so live updates recolour in place and never
+   *  rebuild tiles. Category mode writes the static tint into the same array
+   *  (nothing animates it there). */
+  private fillFor(w: LiveWorkload, lit: RGBA, alpha: number): RGBA {
     const f = w.fillRGBA;
     f[0] = lit[0];
     f[1] = lit[1];
@@ -788,15 +1331,40 @@ export class HexGrid extends VizBase implements MonitorTarget {
     return sampleStops(this.critStops, 1 - clamp01(severity));
   }
 
+  /** A cell's health colour — neutral for resources nothing is reported for. */
+  private bodyColor(w: LiveWorkload): RGBA {
+    return w.monitored ? this.critColor(w.crit) : UNMONITORED;
+  }
+
   private applyPulse(base: RGBA, pulse: number): RGBA {
     const osc = 0.5 + 0.5 * Math.sin(this.clock * 8);
     return interpolateRgb(base, HOT, clamp01(pulse) * osc * 0.75);
   }
 
-  private drawWorkload(w: LiveWorkload, cellPx: number, out: TileElement[]): void {
+  private drawWorkload(
+    w: LiveWorkload,
+    cellPx: number,
+    out: TileElement[],
+    ownsWires: boolean,
+  ): void {
     const category = this.colorMode === 'category';
-    const base = category ? w.tint : this.critColor(w.crit);
+    const base = category ? w.tint : this.bodyColor(w);
     const lit = !category && w.pulse > 0.001 ? this.applyPulse(base, w.pulse) : base;
+    // While a cell is hovered, only that cell, whatever it is wired to, and the
+    // wires between them stay lit; everything else is drawn faded out.
+    const focusing = this.relations && this.focusSet !== null && cellPx >= WIRE_MIN_CELL_PX;
+    if (focusing && !(this.focusSet as Set<LiveWorkload>).has(w)) {
+      // Drawn at the full cell radius, so it swallows its own cluster bed's rim
+      // and one hexagon replaces the cell's whole close-up rendering.
+      for (const el of this.dimElements(w, lit)) out.push(el);
+      return;
+    }
+
+    // Close up, show what this resource belongs with: the bed it shares with the
+    // rest of its cluster, drawn under the cell.
+    if (this.relations && cellPx >= BED_MIN_CELL_PX && w.bedColor) {
+      for (const el of this.bedElements(w)) out.push(el);
+    }
 
     // Cells of the same workload merge (no interior seam) while a gap separates
     // neighbouring workloads. With 3D on, each becomes an extruded prism whose
@@ -811,46 +1379,349 @@ export class HexGrid extends VizBase implements MonitorTarget {
       const alpha = category ? 0.92 : WORKLOAD_ALPHA;
       const fill: RGBA = [lit[0], lit[1], lit[2], alpha];
       out.push({ type: 'extruded', rings: w.outline, height, fill, layer: 1, depth: 0 });
-    } else if (w.cells.length === 1) {
-      // Fast path: a single-cell workload is exactly one pointy-top hexagon, so
-      // emit the instanced hexagon shape instead of a CPU-tessellated polygon
-      // ring — this is what keeps tens of thousands of live cells fast.
-      const rad = this.worldHexRadius * (1 - GAP_FRAC);
+    } else if (focusing && w === this.focus) {
+      // On an accent ring, and above it — the ring has to outrank the faded
+      // neighbours it overlaps, which the shared body element cannot.
+      for (const el of this.anchorElements(w)) out.push(el);
+    } else {
+      out.push(this.bodyElement(w, lit));
+    }
+
+    // Closer still, the wiring itself: hairlines as soon as the cells separate,
+    // full-bodied wires further in. Each link is drawn once — by its lower-indexed
+    // end, or as two halves when it runs far — so its opacity lands exactly as
+    // the kind's style asks. Under focus only the hovered cell's wires remain.
+    if (this.relations && w.links && ownsWires && cellPx >= WIRE_MIN_CELL_PX) {
+      for (const el of this.wiresFor(w, cellPx, focusing)) out.push(el);
+    }
+
+    if (cellPx >= LABEL_MIN_CELL_PX) this.pushLabel(w, lit, elevation, out);
+  }
+
+  /** The resource-type code inside the cell, once the cell is big enough. */
+  private pushLabel(w: LiveWorkload, lit: RGBA, elevation: number, out: TileElement[]): void {
+    const text = fitLabel(w.label ?? w.name, labelCapacity());
+    if (!text) return;
+    const fill = this.fillFor(w, lit, 1);
+    out.push({
+      type: 'text',
+      x: w.worldCenter[0],
+      y: w.worldCenter[1],
+      size: labelWorldSize(this.worldHexRadius),
+      text,
+      color: labelColorFor(fill),
+      font: LABEL_FONT,
+      tracking: LABEL_TRACKING,
+      align: 'center',
+      elevation,
+      layer: 3,
+      depth: 0,
+    });
+  }
+
+  /**
+   * The workload's layer-0 body, built once and then reused by every tile and
+   * zoom level that shows it. A single-cell workload is exactly one pointy-top
+   * hexagon, so it emits the instanced shape rather than a CPU-tessellated
+   * polygon ring; larger clusters keep the merged outline (which also lets the
+   * renderer's triangulation cache survive across tiles).
+   */
+  private bodyElement(w: LiveWorkload, lit: RGBA): ShapeElement | VectorElement {
+    let el = w.body;
+    if (!el) {
+      if (w.cells.length === 1) {
+        const d = 2 * this.worldHexRadius * (1 - GAP_FRAC);
+        el = {
+          type: 'shape',
+          shape: 'hexagon',
+          x: w.worldCenter[0],
+          y: w.worldCenter[1],
+          w: d,
+          h: d,
+          fill: w.fillRGBA,
+          layer: 1,
+          depth: 0,
+        };
+      } else {
+        el = { type: 'vector', rings: w.outline, fill: w.fillRGBA, layer: 1, depth: 0 };
+      }
+      w.body = el;
+    }
+    this.fillFor(w, lit, w.cells.length === 1 ? 1 : 0.95);
+    return el;
+  }
+
+  /**
+   * The bed under a workload: one hexagon per cell at the full cell radius,
+   * filled with the cluster's colour. Full radius means the beds of cells in the
+   * same cluster meet with no seam, so a resource group reads as one slab that
+   * its cells sit on, while the moat walling the cluster off stays background.
+   * Built once and shared by every tile, like `body`.
+   */
+  private bedElements(w: LiveWorkload): ShapeElement[] {
+    let bed = w.bed;
+    if (!bed) {
+      const d = 2 * this.worldHexRadius;
+      const fill = w.bedColor ?? this.neutralTint;
+      bed = w.worldCells.map(([x, y]) => ({
+        type: 'shape' as const,
+        shape: 'hexagon' as const,
+        x,
+        y,
+        w: d,
+        h: d,
+        fill,
+        layer: 0,
+        depth: 0,
+      }));
+      w.bed = bed;
+    }
+    return bed;
+  }
+
+  /** A cell the hover has nothing to do with, drawn in its own colour faded into
+   *  the background. One hexagon at the full cell radius replaces bed, body and
+   *  everything else, so a faded map costs fewer instances than a lit one. */
+  private dimElements(w: LiveWorkload, lit: RGBA): ShapeElement[] {
+    const f = (w.dimRGBA ??= [0, 0, 0, 1]);
+    for (let i = 0; i < 3; i++) f[i] = this.bg[i] + (lit[i] - this.bg[i]) * DIM_MIX;
+    let dim = w.dim;
+    if (!dim) {
+      const d = 2 * this.worldHexRadius;
+      dim = w.worldCells.map(([x, y]) => ({
+        type: 'shape' as const,
+        shape: 'hexagon' as const,
+        x,
+        y,
+        w: d,
+        h: d,
+        fill: f,
+        layer: 1,
+        depth: 0,
+      }));
+      w.dim = dim;
+    }
+    return dim;
+  }
+
+  /** The hovered cell itself: an accent ring, and its body above it. Built fresh
+   *  — one cell is ever hovered, and the ring has to sit above the faded cells
+   *  around it, which the shared body element's layer cannot. */
+  private anchorElements(w: LiveWorkload): ShapeElement[] {
+    const out: ShapeElement[] = [];
+    const d = 2 * this.worldHexRadius * (1 - GAP_FRAC);
+    const ring = 2 * this.worldHexRadius * FOCUS_RING;
+    for (const [x, y] of w.worldCells) {
       out.push({
         type: 'shape',
         shape: 'hexagon',
-        x: w.worldCenter[0],
-        y: w.worldCenter[1],
-        w: 2 * rad,
-        h: 2 * rad,
-        fill: this.fillFor(w, lit, category, 1),
-        layer: 1,
+        x,
+        y,
+        w: ring,
+        h: ring,
+        fill: FOCUS_RING_COLOR,
+        layer: 2,
         depth: 0,
       });
-    } else {
       out.push({
-        type: 'vector',
-        rings: w.outline,
-        fill: this.fillFor(w, lit, category, 0.95),
-        layer: 1,
-        depth: 0,
-      });
-    }
-
-    if (cellPx >= LABEL_PX) {
-      out.push({
-        type: 'text',
-        x: w.worldCenter[0],
-        y: w.worldCenter[1],
-        size: 11,
-        text: w.label ?? w.name,
-        color: [0.96, 0.98, 1, 1],
-        align: 'center',
-        floating: true,
-        elevation,
+        type: 'shape',
+        shape: 'hexagon',
+        x,
+        y,
+        w: d,
+        h: d,
+        fill: this.fillFor(w, this.colorMode === 'category' ? w.tint : this.bodyColor(w), 1),
         layer: 3,
         depth: 0,
       });
+    }
+    return out;
+  }
+
+  /**
+   * A workload's standing wires, cached per tier. Both ends are trimmed back so
+   * the wire crosses the seam between the two cells without covering either
+   * centre (and its glyph). A short link is one line, drawn by its lower-indexed
+   * end; a long one is drawn as two halves, one from each end. Either way every
+   * piece is drawn exactly once, which is what lets a kind's opacity mean what
+   * it says.
+   */
+  private wireElements(w: LiveWorkload): VectorElement[] {
+    return (w.wires ??= this.buildWires(w, { faint: false }));
+  }
+
+  /** The same wires as hairlines: a constant screen width, so they stay visible
+   *  when a cell is only a few pixels across instead of thinning to nothing. */
+  private faintWireElements(w: LiveWorkload): VectorElement[] {
+    return (w.wiresFaint ??= this.buildWires(w, { faint: true }));
+  }
+
+  /** Every link of the hovered cell, whole rather than halved, opaque and
+   *  thicker. Built fresh: only one cell is ever hovered. */
+  private focusWires(w: LiveWorkload): VectorElement[] {
+    return this.buildWires(w, { faint: false, gain: FOCUS_WIRE_GAIN, all: true });
+  }
+
+  /** What this cell contributes to the wiring at this zoom: while a cell is
+   *  hovered, only that one draws — its whole link set. */
+  private wiresFor(w: LiveWorkload, cellPx: number, focusing: boolean): VectorElement[] {
+    if (focusing) return w === this.focus ? this.focusWires(w) : NO_WIRES;
+    return cellPx >= WIRE_FULL_CELL_PX ? this.wireElements(w) : this.faintWireElements(w);
+  }
+
+  private buildWires(
+    w: LiveWorkload,
+    opts: { faint: boolean; gain?: number; all?: boolean },
+  ): VectorElement[] {
+    const R = this.worldHexRadius;
+    const trim = WIRE_TRIM * R;
+    const gain = opts.gain ?? 1;
+    const base = opts.faint ? WIRE_FAINT_PX : WIRE_WIDTH * R;
+    const split = WIRE_SPLIT_SPAN * SQRT3 * R;
+    const [x0, y0] = w.worldCenter;
+    const out: VectorElement[] = [];
+    for (const l of w.links ?? []) {
+      const o = l.to;
+      if (!this.linkVisible(l.kind)) continue;
+      const dx = o.worldCenter[0] - x0;
+      const dy = o.worldCenter[1] - y0;
+      const len = Math.hypot(dx, dy);
+      if (len < 1e-9) continue;
+      // A link that runs further than `split` is drawn as two halves, one from
+      // each end, so it shows from either side even when the far end is well
+      // outside the loaded tiles. Shorter ones are a single line, left to the
+      // lower-indexed end.
+      const halve = !opts.all && len > split;
+      if (!opts.all && !halve && o.index < w.index) continue;
+      const t = Math.min(trim, len * 0.4);
+      const ux = (dx / len) * t;
+      const uy = (dy / len) * t;
+      const ex = halve ? x0 + dx * 0.5 : o.worldCenter[0] - ux;
+      const ey = halve ? y0 + dy * 0.5 : o.worldCenter[1] - uy;
+      const st = this.linkStyle(l.kind, opts.faint, opts.all === true);
+      out.push({
+        type: 'vector',
+        rings: [[x0 + ux, y0 + uy, ex, ey]],
+        stroke: st.color,
+        strokeWidth: base * st.width * gain,
+        strokeScreen: opts.faint,
+        layer: 2,
+        depth: 0,
+      });
+    }
+    return out;
+  }
+
+  /** The colour and width multiplier for a link kind in one tier: as declared
+   *  when drawn in full, dimmed as a hairline, fully opaque under the pointer. */
+  private linkStyle(
+    kind: string | undefined,
+    faint: boolean,
+    focused: boolean,
+  ): { color: RGBA; width: number } {
+    const key = `${kind ?? ''}|${faint ? 'f' : focused ? 'o' : 'n'}`;
+    let st = this.linkStyleCache.get(key);
+    if (!st) {
+      const base = (kind ? this.linkStyles[kind] : undefined) ?? { color: WIRE_COLOR };
+      const a = base.color[3];
+      const alpha = faint ? a * WIRE_FAINT_ALPHA : focused ? 1 : a;
+      st = {
+        color: [base.color[0], base.color[1], base.color[2], alpha],
+        width: base.width ?? 1,
+      };
+      this.linkStyleCache.set(key, st);
+    }
+    return st;
+  }
+
+  /**
+   * Track the cell under the pointer, together with everything it is wired to:
+   * that set stays lit while the rest of the map fades out. Only while focus
+   * mode is on — changing it rebuilds the visible tiles, so left on by default
+   * the map would redraw for every cell the pointer merely crosses.
+   */
+  private setFocus(w: LiveWorkload | null): void {
+    const next = this.focusMode ? w : null;
+    if (this.focus === next) return;
+    this.focus = next;
+    this.rebuildFocusSet();
+    if (this.focusVisible()) this.invalidate();
+  }
+
+  private rebuildFocusSet(): void {
+    const w = this.focus;
+    if (!w) {
+      this.focusSet = null;
+      return;
+    }
+    const set = new Set<LiveWorkload>([w]);
+    for (const l of w.links ?? []) if (this.linkVisible(l.kind)) set.add(l.to);
+    this.focusSet = set;
+  }
+
+  private linkVisible(kind: string | undefined): boolean {
+    return kind === undefined || !this.hiddenKinds.has(kind);
+  }
+
+  private focusVisible(): boolean {
+    if (!this.relations) return false;
+    const cellPx = 2 * this.worldHexRadius * TILE_SIZE * Math.pow(2, this.currentTileZ);
+    return cellPx >= WIRE_MIN_CELL_PX;
+  }
+
+  /**
+   * Resolve every `deps` entry into a direct reference on both endpoints, so a
+   * cell knows its links whichever end of one it is, and carries the kind the
+   * wire is drawn in. Names with no placed cell (and self-links) are dropped.
+   */
+  private buildRelations(placed: { input: WorkloadInput; p: PlacedWorkload }[]): void {
+    for (const { input } of placed) {
+      const deps = input.deps;
+      if (!deps || deps.length === 0) continue;
+      const a = this.byName.get(input.name);
+      if (!a) continue;
+      for (const dep of deps) {
+        const b = this.byName.get(linkId(dep));
+        if (!b || b === a || a.links?.some((l) => l.to === b)) continue;
+        const kind = typeof dep === 'string' ? undefined : dep.kind;
+        (a.links ??= []).push({ to: b, kind });
+        (b.links ??= []).push({ to: a, kind });
+      }
+    }
+  }
+
+  /**
+   * Bed colour for a containment path: a stable hue per cluster, mixed most of
+   * the way back toward the background so neighbouring clusters stay
+   * distinguishable without the bed competing with the health colour drawn on
+   * top of it.
+   */
+  private bedColorFor(path: string[] | undefined): RGBA | undefined {
+    if (!path || path.length === 0) return undefined;
+    const key = path.join('\u0001');
+    let c = this.bedColors.get(key);
+    if (!c) {
+      c = this.bedTarget(key);
+      this.bedColors.set(key, c);
+    }
+    return c;
+  }
+
+  private bedTarget(key: string): RGBA {
+    const hue = this.colorMode === 'category' ? BED_NEUTRAL : BED_HUE(hashString(key));
+    const c = interpolateRgb(this.bg, hue, BED_MIX);
+    c[3] = 1; // opaque: a bed is drawn again wherever a cell straddles two tiles
+    return c;
+  }
+
+  /** Repaint every bed in place after a colour-mode switch — the cached bed
+   *  elements hold on to these very arrays. */
+  private refreshBedColors(): void {
+    for (const [key, c] of this.bedColors) {
+      const t = this.bedTarget(key);
+      c[0] = t[0];
+      c[1] = t[1];
+      c[2] = t[2];
     }
   }
 

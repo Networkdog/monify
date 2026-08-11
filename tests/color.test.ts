@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   hexToRgba,
   interpolateRgb,
+  oklchToRgba,
   sampleStops,
   sequential,
   diverging,
@@ -9,6 +10,8 @@ import {
   resolveColor,
 } from '../src/color/scales';
 import { SEQUENTIAL, DIVERGING, CATEGORICAL } from '../src/color/palettes';
+import { categoryColor } from '../src/shape/encode';
+import { relativeLuminance } from '../src/viz/hexgrid/label';
 import type { RGBA } from '../src/core/types';
 
 const approx = (a: RGBA, b: RGBA, eps = 1e-6): void => {
@@ -82,5 +85,72 @@ describe('resolveColor', () => {
     approx(resolveColor('#ff0000'), [1, 0, 0, 1]);
     approx(resolveColor([0.1, 0.2, 0.3]), [0.1, 0.2, 0.3, 1]);
     approx(resolveColor([0.1, 0.2, 0.3, 0.4]), [0.1, 0.2, 0.3, 0.4]);
+  });
+});
+
+describe('oklchToRgba', () => {
+  it('maps the achromatic ends onto black and white', () => {
+    approx(oklchToRgba(0, 0, 0), [0, 0, 0, 1], 1e-6);
+    approx(oklchToRgba(1, 0, 0), [1, 1, 1, 1], 1e-6);
+  });
+
+  it('gamut-maps an impossible chroma instead of clipping the hue away', () => {
+    // No sRGB color is this colorful; chroma is reduced until one fits.
+    const c = oklchToRgba(0.7, 0.9, 30);
+    for (let i = 0; i < 3; i++) {
+      expect(c[i]).toBeGreaterThanOrEqual(0);
+      expect(c[i]).toBeLessThanOrEqual(1);
+    }
+    // Hue 30° is orange-red: the channels must still rank r > g > b.
+    expect(c[0]).toBeGreaterThan(c[1]);
+    expect(c[1]).toBeGreaterThan(c[2]);
+  });
+});
+
+describe('status ramp', () => {
+  const stops = DIVERGING.status.map((h) => hexToRgba(h));
+
+  it('runs critical → healthy', () => {
+    // Sampled with (1 - severity), so index 0 is what severity 1.0 lands on.
+    const crit = stops[0];
+    const healthy = stops[stops.length - 1];
+    expect(crit[0]).toBeGreaterThan(crit[1]); // red-dominant
+    expect(healthy[1]).toBeGreaterThan(healthy[0]); // green-dominant
+  });
+
+  it('settles down at the healthy end so incidents are the loud thing', () => {
+    const healthy = relativeLuminance(stops[stops.length - 1]);
+    const mid = relativeLuminance(stops[(stops.length - 1) / 2]);
+    const crit = relativeLuminance(stops[0]);
+    expect(healthy).toBeLessThan(crit);
+    expect(healthy).toBeLessThan(mid);
+  });
+});
+
+describe('categoryColor', () => {
+  const many = Array.from({ length: 64 }, (_, i) => categoryColor(i));
+
+  it('is stable per index', () => {
+    expect(categoryColor(7)).toEqual(categoryColor(7));
+  });
+
+  it('keeps every category equally loud', () => {
+    // The point of OKLCH over HSL: no category is nearly invisible on the dark
+    // canvas, and none blows out to near white.
+    for (const c of many) {
+      const lum = relativeLuminance(c);
+      expect(lum).toBeGreaterThan(0.1);
+      expect(lum).toBeLessThan(0.9);
+    }
+  });
+
+  it('gives neighbouring categories separated colors', () => {
+    for (let i = 1; i < many.length; i++) {
+      const d =
+        Math.abs(many[i][0] - many[i - 1][0]) +
+        Math.abs(many[i][1] - many[i - 1][1]) +
+        Math.abs(many[i][2] - many[i - 1][2]);
+      expect(d, `index ${i}`).toBeGreaterThan(0.15);
+    }
   });
 });

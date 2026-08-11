@@ -116,7 +116,7 @@ export class TextureCache {
    *   `"italic 'Courier New', monospace"`.
    *   The size is always injected by the engine.
    */
-  getText(text: string, sizePx: number, color: RGBA, fontSpec?: string): TextureEntry {
+  getText(text: string, sizePx: number, color: RGBA, fontSpec?: string, tracking?: string, halo?: RGBA): TextureEntry {
     const r = Math.round(color[0] * 255);
     const g = Math.round(color[1] * 255);
     const b = Math.round(color[2] * 255);
@@ -124,7 +124,8 @@ export class TextureCache {
     // Snap to a discrete bucket so the cache key stays stable across a zoom.
     const bucket = bucketTextSize(sizePx);
     const fontKey = fontSpec ?? '';
-    const key = `text:${bucket}:${r},${g},${b},${a}:${fontKey}:${text}`;
+    const haloKey = halo ? halo.map((v) => Math.round(v * 255)).join(',') : '';
+    const key = `text:${bucket}:${r},${g},${b},${a}:${fontKey}:${tracking ?? ''}:${haloKey}:${text}`;
     const cached = this.map.get(key);
     if (cached) { cached.lastUsedFrame = this.frame; return cached; }
 
@@ -166,10 +167,15 @@ export class TextureCache {
       font = `${sizePx}px ${defaultFamily}`;
     }
     ctx.font = font;
+    // Ignored by browsers without Canvas letter-spacing; harmless there.
+    const spaced = ctx as CanvasRenderingContext2D & { letterSpacing?: string };
+    if (tracking) spaced.letterSpacing = tracking;
     const metrics = ctx.measureText(text);
     const ascent = metrics.actualBoundingBoxAscent || sizePx * 0.8;
     const descent = metrics.actualBoundingBoxDescent || sizePx * 0.2;
-    const padding = 2;
+    // The outline straddles the glyph edge, so reserve half of it on each side.
+    const haloWidth = halo ? Math.max(1.5, sizePx * 0.09) : 0;
+    const padding = 2 + Math.ceil(haloWidth / 2);
     const w = Math.max(1, Math.ceil(metrics.width + padding * 2));
     const h = Math.max(1, Math.ceil(ascent + descent + padding * 2));
     canvas.width = w;
@@ -177,7 +183,18 @@ export class TextureCache {
     // Resizing resets context state; re-apply font and baseline.
     ctx.clearRect(0, 0, w, h);
     ctx.font = font;
+    if (tracking) spaced.letterSpacing = tracking;
     ctx.textBaseline = 'alphabetic';
+    if (halo) {
+      const hr = Math.round(halo[0] * 255);
+      const hg = Math.round(halo[1] * 255);
+      const hb = Math.round(halo[2] * 255);
+      ctx.strokeStyle = `rgba(${hr},${hg},${hb},${halo[3]})`;
+      ctx.lineWidth = haloWidth;
+      ctx.lineJoin = 'round';
+      ctx.miterLimit = 2;
+      ctx.strokeText(text, padding, padding + ascent);
+    }
     ctx.fillStyle = `rgba(${r},${g},${b},${a})`;
     ctx.fillText(text, padding, padding + ascent);
 

@@ -1,6 +1,8 @@
 // Lightweight DOM tooltip overlay for "details on demand" on hover. Positioned
 // in fixed (viewport) coordinates and nudged to stay on-screen near an edge.
 
+import { INK, SURFACE } from '../color/tokens';
+
 export interface TooltipData {
   title: string;
   body: string[];
@@ -13,19 +15,20 @@ export class Tooltip {
     this.el = document.createElement('div');
     this.el.style.cssText =
       'position:fixed;pointer-events:none;opacity:0;z-index:100;' +
-      'background:rgba(10,12,18,0.92);border:1px solid rgba(120,160,220,0.35);' +
-      'border-radius:6px;padding:8px 12px;max-width:280px;' +
-      'font:12px/1.45 system-ui,sans-serif;color:#e8eaf2;' +
-      'transition:opacity 0.12s;box-shadow:0 4px 14px rgba(0,0,0,0.5);';
+      `background:color-mix(in srgb, ${SURFACE.panel} 94%, transparent);` +
+      `border:1px solid ${SURFACE.border};` +
+      'border-radius:8px;padding:9px 12px;max-width:280px;' +
+      `font:12px/1.45 ui-sans-serif,system-ui,sans-serif;color:${INK.primary};` +
+      'transition:opacity 0.12s;box-shadow:0 8px 24px rgba(0,0,0,0.55);';
     parent.appendChild(this.el);
   }
 
   show(data: TooltipData, clientX: number, clientY: number): void {
-    const title = `<div style="color:#78b4f0;font-weight:700;margin-bottom:3px">${escapeHtml(
+    const title = `<div style="color:${INK.accent};font-weight:650;margin-bottom:4px">${escapeHtml(
       data.title,
     )}</div>`;
     const body = data.body
-      .map((l) => `<div style="color:#c4c8d4">${escapeHtml(l)}</div>`)
+      .map((l) => `<div style="color:${INK.muted}">${escapeHtml(l)}</div>`)
       .join('');
     this.el.innerHTML = title + body;
     this.el.style.opacity = '1';

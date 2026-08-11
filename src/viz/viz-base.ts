@@ -131,6 +131,7 @@ export abstract class VizBase {
           this.moved = true;
         }
         this.tooltip.hide();
+        this.onHoverEnd();
         return;
       }
       this.hoverX = e.clientX;
@@ -142,7 +143,10 @@ export abstract class VizBase {
       const [wx, wy] = this.clientToWorld(e.clientX, e.clientY);
       this.pick(wx, wy, this.currentTileZ);
     };
-    this.onPointerLeave = () => this.tooltip.hide();
+    this.onPointerLeave = () => {
+      this.tooltip.hide();
+      this.onHoverEnd();
+    };
 
     this.canvas.addEventListener('pointerdown', this.onPointerDown);
     this.canvas.addEventListener('pointermove', this.onPointerMove);
@@ -169,6 +173,11 @@ export abstract class VizBase {
   /** Return tooltip content for a hovered world point, or null. */
   protected hitTest(_wx: number, _wy: number, _z: number): TooltipData | null {
     return null;
+  }
+
+  /** The pointer stopped hovering (it left the canvas or started a drag). */
+  protected onHoverEnd(): void {
+    /* default: no-op */
   }
 
   /** Handle a click at a world point (e.g. fly into a cell). */

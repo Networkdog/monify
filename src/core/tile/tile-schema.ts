@@ -75,6 +75,10 @@ export interface TextElement extends BaseElement {
   align?: 'left' | 'center';
   /** CSS font string fragment: weight, style, and family. Default: 'ui-sans-serif, system-ui, sans-serif'. */
   font?: string;
+  /** CSS letter-spacing (e.g. '0.03em'). Open up small text, tighten large text. */
+  tracking?: string;
+  /** Outline drawn behind the glyph so it keeps contrast over any background. */
+  halo?: RGBA;
   /** Optional max width (world units) for wrapping. */
   maxWidth?: number;
   /**
@@ -98,6 +102,9 @@ export interface VectorElement extends BaseElement {
   fill?: RGBA;
   stroke?: RGBA;
   strokeWidth?: number;
+  /** Interpret `strokeWidth` as constant screen pixels, as on ShapeElement — a
+   *  hairline stays a hairline at every zoom instead of vanishing. */
+  strokeScreen?: boolean;
   /**
    * Renderer cache: the fill triangulated ONCE into a world-space triangle soup
    * ([x0,y0,x1,y1,...]). Filled lazily by the scene on first draw, or supplied
@@ -138,11 +145,49 @@ export interface TileJSON {
   elements: TileElement[];
 }
 
+/**
+ * One geometry bucket's worth of pre-packed instance records. Positions are
+ * relative to the tile origin, so drawing only adds the camera offset.
+ */
+export interface PackedShapeBatch {
+  /** Instance records, `COLORED_STRIDE` floats each. */
+  data: Float32Array;
+  /**
+   * The live fill array behind each instance. Colours are copied into `data`
+   * and refreshed from here whenever the scene reports a content change, so
+   * recolouring in place still works without a tile rebuild — the same contract
+   * as `VectorElement.fillTris`.
+   */
+  fills: RGBA[];
+  count: number;
+}
+
+/**
+ * Renderer cache: a tile's plain shapes packed once at build time. Geometry is
+ * frozen here, so moving or resizing an element afterwards needs a tile rebuild.
+ */
+export interface PackedTile {
+  /** Tile origin the packed positions are relative to (world units). */
+  ox: number;
+  oy: number;
+  /** `Scene` colour epoch the inline fills were last refreshed at. */
+  epoch: number;
+  flat: PackedShapeBatch | null;
+  flatHex: PackedShapeBatch | null;
+  box: PackedShapeBatch | null;
+  cyl: PackedShapeBatch | null;
+  hex: PackedShapeBatch | null;
+  /** Elements the packer skipped — non-shapes and camera-dependent shapes. */
+  rest: FlatElement[];
+}
+
 export interface FlatTile {
   z: number;
   x: number;
   y: number;
   elements: FlatElement[];
+  /** Filled lazily on first draw; `null` means the tile wasn't worth packing. */
+  packed?: PackedTile | null;
 }
 
 /** Recursively flatten group transforms into absolute coordinates. */
@@ -198,6 +243,8 @@ function walk(
         type: 'text', id: e.id, layer: e.layer, depth: e.depth,
         x: tx + e.x * scale, y: ty + e.y * scale,
         size: e.size * scale, text: e.text, color: e.color, maxWidth: e.maxWidth,
+        align: e.align, font: e.font, tracking: e.tracking, floating: e.floating,
+        halo: e.halo,
         elevation: e.elevation,
       });
     } else if (e.type === 'vector') {
@@ -212,6 +259,7 @@ function walk(
       out.push({
         type: 'vector', id: e.id, layer: e.layer, depth: e.depth,
         rings, fill: e.fill, stroke: e.stroke, strokeWidth: e.strokeWidth,
+        strokeScreen: e.strokeScreen,
       });
     } else if (e.type === 'extruded') {
       const rings = e.rings.map((r) => {

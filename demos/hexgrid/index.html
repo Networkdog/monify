@@ -5,26 +5,36 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>HexGrid · monify</title>
     <style>
+      /* Same tokens as src/color/tokens.ts — Tailwind slate surfaces, sky accent. */
+      :root {
+        --canvas: #0a0f1a;
+        --panel: #0f172a;
+        --border: #334155;
+        --ink: #e2e8f0;
+        --ink-muted: #94a3b8;
+        --accent: #38bdf8;
+      }
       * { margin: 0; padding: 0; box-sizing: border-box; }
-      html, body { width: 100%; height: 100%; overflow: hidden; background: #0d0f13; }
+      html, body { width: 100%; height: 100%; overflow: hidden; background: var(--canvas); }
       #view { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; touch-action: none; }
       .overlay {
         position: fixed;
         font: 12px/1.45 ui-sans-serif, system-ui, sans-serif;
-        color: #e8eaf2;
+        color: var(--ink);
         pointer-events: none;
         z-index: 10;
       }
-      #hud { top: 12px; left: 14px; opacity: 0.85; }
+      #hud { top: 12px; left: 14px; color: var(--ink-muted); font-variant-numeric: tabular-nums; }
       #title { top: 12px; right: 14px; text-align: right; }
-      #title b { font-size: 14px; letter-spacing: 0.3px; }
-      #title a { color: #78b4f0; pointer-events: auto; text-decoration: none; }
-      #hint { bottom: 12px; right: 14px; opacity: 0.7; text-align: right; }
+      #title b { font-size: 14px; letter-spacing: -0.2px; }
+      #title a { color: var(--accent); pointer-events: auto; text-decoration: none; }
+      #title .sub { color: var(--ink-muted); }
+      #hint { bottom: 12px; right: 14px; color: var(--ink-muted); text-align: right; }
       #legend {
         bottom: 12px; left: 14px; width: 240px;
-        background: rgba(12, 14, 20, 0.7);
-        border: 1px solid rgba(120, 160, 220, 0.25);
-        border-radius: 6px; padding: 8px 10px;
+        background: color-mix(in srgb, var(--panel) 88%, transparent);
+        border: 1px solid var(--border);
+        border-radius: 10px; padding: 10px 12px;
       }
     </style>
   </head>
@@ -33,7 +43,7 @@
     <div id="hud" class="overlay">loading…</div>
     <div id="title" class="overlay">
       <b>HexGrid</b><br />
-      <span style="opacity: 0.7">workload monitor · <a href="/">← all demos</a></span>
+      <span class="sub">workload monitor · <a href="/">← all demos</a></span>
     </div>
     <div id="legend" class="overlay"></div>
     <div id="hint" class="overlay">scroll to zoom · drag to pan · click a workload to fly in</div>
