@@ -1,11 +1,11 @@
 // HexGrid — a honeycomb workload monitor.
 //
 // Each workload occupies one or more hexagonal cells at a name-determined
-// position (see placement.ts). Cell color encodes criticality (the `status`
-// ramp: deep emerald = healthy → vivid rose = critical); an active anomaly makes
-// a workload pulse. Zooming crosses into the next semantic layer every few zoom
-// levels, replacing each cell with a finer honeycomb that fills it
-// (self-similar), while metric changes animate the colors smoothly in real time.
+// position (see placement.ts). Cell color encodes criticality (RdYlGn: green =
+// healthy → red = critical); an active anomaly makes a workload pulse. Zooming
+// crosses into the next semantic layer every few zoom levels, replacing each
+// cell with a finer honeycomb that fills it (self-similar), while metric
+// changes animate the colors smoothly in real time.
 
 import { VizBase } from '../viz-base';
 import type { TileJSON, TileElement, ShapeElement, VectorElement } from '../../core/tile';
@@ -39,6 +39,7 @@ import {
   pixelToAxial,
   hexRound,
   hexPolygon,
+  hexSpiral,
   axialKey,
   spiralRadiusFor,
   type Axial,
@@ -171,6 +172,16 @@ interface LiveResource {
   kind: string;
   target: number;
   current: number;
+  /** Persistent RGBA the metric layer references, so a value change recolours
+   *  in place instead of rebuilding the tile. */
+  fillRGBA: RGBA;
+}
+
+/** One metric's hexagon inside its resource: world centre and radius. */
+interface MetricCell {
+  x: number;
+  y: number;
+  r: number;
 }
 
 interface LiveWorkload {
@@ -189,66 +200,19 @@ interface LiveWorkload {
    *  changes mutate this array in place (+markDirty) instead of rebuilding the
    *  whole estate's tiles every update. Alpha is fixed once at build time. */
   fillRGBA: RGBA;
-  /** Layer-0 body element, built once and shared by every tile and zoom level
-   *  showing this cell. A zoom-level change re-emits every visible cell, so one
-   *  fresh element per cell per rebuild is what turns that into a stall. */
-  body?: ShapeElement | VectorElement;
   label?: string;
   tint: RGBA;
   tooltip?: string[];
   resources: LiveResource[];
-  /** Containment path (coarse→fine) used to bucket cells into zoom-out aggregates. */
-  groupPath?: string[];
-  /** False when no health is reported for this resource (see WorkloadInput.monitored). */
-  monitored: boolean;
-  /** Position in `workloads` — a link is drawn by its lower-indexed end only. */
-  index: number;
-  /** Resources this one is wired to — `deps` resolved to both ends of each link. */
-  links?: { to: LiveWorkload; kind?: string }[];
-  /** Bed colour shared by every cell of the same finest containment cluster. */
-  bedColor?: RGBA;
-  /** Cached bed hexagons, faded-out cells and link wires. Like `body`, built on
-   *  the first close-up draw and then shared by every tile and zoom level. */
-  bed?: ShapeElement[];
-  dim?: ShapeElement[];
-  /** Fill behind `dim`: this cell's own colour faded toward the background. */
-  dimRGBA?: RGBA;
-  wires?: VectorElement[];
-  wiresFaint?: VectorElement[];
-}
-
-/**
- * A zoom-out aggregate: one subscription's worth of cells collapsed to a single
- * hexagon glyph. Drawn as an instanced `shape` (O(1) repack) — not a tessellated
- * polygon — so the far overview costs a few hundred instances instead of tens of
- * thousands of cells. Its colour is the members' worst-case health, recoloured
- * in place so a live update needs no tile rebuild.
- */
-interface Aggregate {
-  center: [number, number];
-  radius: number;
-  bbox: { minx: number; miny: number; maxx: number; maxy: number };
-  members: LiveWorkload[];
-  count: number;
-  label: string;
-  worstCrit: number;
-  /** True when at least one member reports health at all. */
-  monitored: boolean;
-  fillRGBA: RGBA;
-  /** Static categorical tint (category colour mode). */
-  tint: RGBA;
 }
 
 const FIT_SPAN = 0.9;
-// Semantic-zoom layers. Every LAYER_SPAN zoom levels the current honeycomb is
-// replaced by the next finer layer, whose cells subdivide each parent cell by
-// LAYER_SUBDIV = 2^LAYER_SPAN (linear). That power-of-two keeps the zoom
-// self-similar: the incoming layer's cells appear at exactly the on-screen size
-// the parent layer had LAYER_SPAN levels earlier. The first swap lands on
-// `firstLayerZoom` (default below); raising it delays the finer layer so fewer,
-// larger sub-cells appear (cheaper) when it finally kicks in.
+// Semantic zoom. Layer 0 is the workload honeycomb: one cell per resource.
+// Past `firstLayerZoom` the view crosses into the metric layer, where each
+// resource cell is replaced by exactly as many hexagons as that resource
+// actually reports metrics — no more, so nothing on screen is invented. There
+// is only the one finer layer; zooming further just enlarges it.
 const LAYER_SPAN = 5;
-const LAYER_SUBDIV = 2 ** LAYER_SPAN;
 const DEFAULT_FIRST_LAYER_Z = 6;
 const PULSE_HALFLIFE = 1.6;
 // 3D extrusion: each workload cell becomes a hex prism whose height (in units
@@ -270,104 +234,11 @@ const GAP_FRAC = 0.08;
 // Fraction of its radius each sub-layer cell is drawn at, leaving a gap between
 // adjacent cells. Reused as the coarser-layer core radius when nesting gaps.
 const SUB_FILL = 0.94;
-// Resources Azure Resource Health reports nothing about (VNet, NIC, NSG, disk,
-// private endpoint …) still shape the map — they are the scaffolding everything
-// else attaches to — so they are drawn in a muted neutral rather than being
-// coloured as if they were healthy.
-const UNMONITORED: RGBA = NEUTRAL;
-// Relationship cues, switched on as the cells grow big enough to be read one by
-// one. The bed is a full-size hexagon under each cell tinted by its cluster, so
-// a resource group's cells sit on one continuous slab with the moat around it
-// left as background; the wires trace the `deps` links that arranged those cells
-// in the first place (a NIC to its VM, a private endpoint to the database it
-// fronts). Beds come first — one extra instance per cell — and the wires follow
-// a couple of zoom levels later, where few enough are on screen to stay legible.
-const BED_MIN_CELL_PX = 16;
-// Wires arrive in two steps. From WIRE_MIN_CELL_PX every link is a
-// screen-constant hairline — thin and faint enough that a whole estate's wiring
-// reads as texture rather than noise — and from WIRE_FULL_CELL_PX the wires
-// thicken with the cells and take their kind's full colour.
-const WIRE_MIN_CELL_PX = 6;
-const WIRE_FULL_CELL_PX = 40;
-/** Hairline width (screen px), and the share of a kind's opacity it keeps. */
-const WIRE_FAINT_PX = 1;
-const WIRE_FAINT_ALPHA = 0.5;
-/** How far a bed is tinted from the background toward its cluster's hue. */
-const BED_MIX = 0.28;
-const BED_HUE = categorical('aurora');
-/** Bed tint used while the cells carry a categorical colour of their own: a
- *  plain slate, so the bed still marks out the cluster without arguing with the
- *  hues on top of it. */
-const BED_NEUTRAL: RGBA = NEUTRAL_LIGHT;
-const WIRE_COLOR: RGBA = HAIRLINE;
-/** Base wire thickness (cell radii) for an unstyled link, and the clearance
- *  kept at each end. A kind's `width` multiplies the thickness. */
-const WIRE_WIDTH = 0.06;
-const WIRE_TRIM = 0.55;
-/** Beyond this span (cell pitches) a link is drawn as two halves, one from each
- *  end. A spoke VNet's peering to its region's Virtual WAN hub crosses the map,
- *  and whichever end you are looking at, the other one is far outside the loaded
- *  tiles — so each end draws its own half, which also keeps the halves from
- *  overlapping and doubling the opacity where they meet. */
-const WIRE_SPLIT_SPAN = 3.5;
-/** The hovered cell's wires keep their kind's colour but go fully opaque and
- *  this much thicker, so they read as "these are the links you asked for". */
-const FOCUS_WIRE_GAIN = 1.7;
-/** While a cell is hovered, every unrelated cell keeps this much of its own
- *  colour and fades the rest of the way into the background, so only that cell,
- *  what it is wired to, and the wires between them stand out. */
-const DIM_MIX = 0.18;
-/** Ring drawn behind the hovered cell (cell radii) to anchor the focus. */
-const FOCUS_RING = 1.12;
-const FOCUS_RING_COLOR: RGBA = hexToRgba(INK.accent);
-const DEFAULT_BG: RGBA = BACKGROUND;
-const NO_WIRES: VectorElement[] = [];
+const HOT: RGBA = [1, 0.96, 0.75, 1];
 const SQRT3 = Math.sqrt(3);
 
 function clamp01(v: number): number {
   return v < 0 ? 0 : v > 1 ? 1 : v;
-}
-
-/**
- * Even-odd point-in-polygon test against a set of world-space rings (parity
- * across all rings so holes are handled). Used to keep the deep-zoom sub-layer
- * fill inside the same inset silhouette that layer 0 draws.
- */
-function pointInRings(x: number, y: number, rings: number[][]): boolean {
-  let inside = false;
-  for (const ring of rings) {
-    const n = ring.length >> 1;
-    for (let i = 0, j = n - 1; i < n; j = i++) {
-      const xi = ring[i * 2], yi = ring[i * 2 + 1];
-      const xj = ring[j * 2], yj = ring[j * 2 + 1];
-      if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) {
-        inside = !inside;
-      }
-    }
-  }
-  return inside;
-}
-
-/**
- * Exact containment test for a pointy-top regular hexagon of circumradius `R`
- * centred at the origin: the hexagon is the intersection of three edge slabs
- * (normals at 0°/60°/120°), each of half-width = inradius = R·√3/2. Used to
- * detect a coarser sub-layer's inter-cell gap when nesting the honeycomb gaps.
- */
-function inHexCore(dx: number, dy: number, R: number): boolean {
-  const k = R * 0.8660254037844386; // inradius = R·√3/2
-  return (
-    Math.abs(dx) <= k &&
-    Math.abs(0.5 * dx + 0.8660254037844386 * dy) <= k &&
-    Math.abs(-0.5 * dx + 0.8660254037844386 * dy) <= k
-  );
-}
-
-/** Small deterministic hash of a sub-cell (q, r, layer) → uint32. */
-function hashCell(q: number, r: number, layer: number): number {
-  let h = (2166136261 ^ (q * 374761393) ^ (r * 668265263) ^ (layer * 2246822519)) >>> 0;
-  h = Math.imul(h ^ (h >>> 15), 2246822519);
-  return (h ^ (h >>> 13)) >>> 0;
 }
 
 /** Resolve the configured placement strategy into a name→placement lookup. */
@@ -379,6 +250,14 @@ function resolvePlacement(opts: HexGridOptions): Map<string, PlacedWorkload> {
       path: w.groupPath ?? (w.group ? [w.group] : [w.name]),
       central: w.central,
     }));
+  // A workload is identified by name everywhere downstream, so a repeated name
+  // silently drops every cell but the last one's — worth saying out loud.
+  const named = new Set(opts.workloads.map((w) => w.name));
+  if (named.size !== opts.workloads.length) {
+    console.warn(
+      `HexGrid: ${opts.workloads.length - named.size} workloads share a name with another and will collapse.`,
+    );
+  }
   if (opts.placement === 'dense') {
     return new Map(placeDense(hierItems()).map((p) => [p.name, p]));
   }
@@ -593,6 +472,7 @@ export class HexGrid extends VizBase implements MonitorTarget {
         crit: clamp01(input.criticality),
         pulse: 0,
         fillRGBA: [0.5, 0.5, 0.5, 1],
+        dimRGBA: [0.5, 0.5, 0.5, 1],
         label: input.label,
         tint: input.tint ?? this.neutralTint,
         tooltip: input.tooltip,
@@ -604,6 +484,7 @@ export class HexGrid extends VizBase implements MonitorTarget {
           kind: res.kind ?? 'resource',
           target: clamp01(res.value),
           current: clamp01(res.value),
+          fillRGBA: this.critColor(clamp01(res.value)),
         })),
       };
       const idx = this.workloads.length;
@@ -778,9 +659,13 @@ export class HexGrid extends VizBase implements MonitorTarget {
     const k = 1 - Math.exp(-this.tweenRate * dt);
     const decay = Math.pow(0.5, dt / PULSE_HALFLIFE);
     const health = this.colorMode === 'health';
+    // Metric fills only need recolouring while the metric layer is on screen;
+    // at the overview that would be a per-metric colour sample nobody sees.
+    const metricsVisible = health && this.metricLayerVisible();
     // Tracks workloads whose layer-0 colour (criticality / pulse) actually
     // moved this step, so we only repaint when something visible changed.
     let colorChanged = false;
+    let metricChanged = false;
     // Only the enrolled (still-tweening) workloads are walked — a settled estate
     // of 50k healthy cells has an empty-to-tiny set, so idle frames are free.
     for (const w of this.activeWorkloads) {
@@ -792,15 +677,22 @@ export class HexGrid extends VizBase implements MonitorTarget {
       } else {
         w.crit = w.targetCrit;
       }
-      // Resources tween for deep-zoom sub-cell fills and tooltips; they don't
-      // drive the layer-0 colour, so they don't force a repaint on their own —
-      // but they DO keep a workload enrolled until they settle.
+      // Resources drive the metric layer's colours, so a moving value has to
+      // repaint once the view is past the swap zoom — recoloured in place, same
+      // as layer 0, so no tile is rebuilt.
       let resSettled = true;
       for (const res of w.resources) {
         const dd = res.target - res.current;
         if (Math.abs(dd) > 1e-4) {
           res.current += dd * k;
           resSettled = false;
+          if (metricsVisible) {
+            const c = this.critColor(res.current);
+            res.fillRGBA[0] = c[0];
+            res.fillRGBA[1] = c[1];
+            res.fillRGBA[2] = c[2];
+            metricChanged = true;
+          }
         } else {
           res.current = res.target;
         }
@@ -832,10 +724,6 @@ export class HexGrid extends VizBase implements MonitorTarget {
     // repaints the live colours with zero tile rebuilds. Deeper sub-layers use
     // procedural per-sub-cell fills (effectively static), so leave them alone.
     if (colorChanged && this.scene.camera.zoom < this.layerBaseZ + LAYER_SPAN) {
-      // When the overview is showing aggregates, refresh their worst-case colour
-      // from the members that just tweened (a few hundred writes) so the
-      // subscription glyphs carry live health too.
-      if (this.aggLevelForZoom(this.scene.camera.zoom) > 0) this.recolorAggregates();
       // At the far overview tens of thousands of cells repaint at once, which
       // can't fit in a single frame — so cap the live-colour repaint rate there
       // to keep the view responsive. Zoomed in (few cells on screen) repaint
@@ -878,8 +766,8 @@ export class HexGrid extends VizBase implements MonitorTarget {
     const scale = TILE_SIZE * Math.pow(2, z);
     const out: TileElement[] = [];
 
-    // Which semantic layer this tile zoom belongs to: 0 is the workload
-    // honeycomb, deeper layers are progressively finer sub-cell fills.
+    // Layer 0 is one cell per resource; past the swap zoom the same area is
+    // redrawn as that resource's metrics.
     const layer = Math.max(0, Math.floor((z - this.layerBaseZ) / LAYER_SPAN));
     if (layer === 0 && this.aggLevelForZoom(z) > 0) {
       // Far overview: one hexagon per subscription instead of every single cell.
@@ -888,7 +776,7 @@ export class HexGrid extends VizBase implements MonitorTarget {
       const cellPx = 2 * this.worldHexRadius * scale;
       this.drawLayer0(ox, oy, x1, y1, cellPx, out);
     } else {
-      this.buildSubLayer(layer, ox, oy, x1, y1, out);
+      this.buildMetricLayer(ox, oy, x1, y1, scale, out);
     }
     return { z, x, y, elements: out };
   }
@@ -924,6 +812,11 @@ export class HexGrid extends VizBase implements MonitorTarget {
         }
       }
     }
+  }
+
+  /** True when the camera is deep enough that tiles draw the metric layer. */
+  private metricLayerVisible(): boolean {
+    return Math.floor(this.scene.camera.zoom) >= this.layerBaseZ + LAYER_SPAN;
   }
 
   /** Bucket workloads into a √N×√N grid by cell centre for fast tile culling. */
@@ -1142,6 +1035,19 @@ export class HexGrid extends VizBase implements MonitorTarget {
     // Hovering also picks the cell whose links are drawn in full.
     this.setFocus(w);
     if (!w) return null;
+    // Past the swap zoom the cursor is over one metric, not the whole resource.
+    // Floor, not the caller's rounded zoom: that is how the viewport picks the
+    // tiles on screen, and the tooltip has to agree with what is drawn.
+    if (this.metricLayerVisible()) {
+      const mi = this.metricAt(w, wx, wy);
+      if (mi >= 0) {
+        const res = w.resources[mi];
+        const body = [`${(res.current * 100).toFixed(0)}% of threshold`];
+        if (res.kind !== 'resource') body.push(res.kind);
+        body.push(w.name);
+        return { title: res.id, body };
+      }
+    }
     const sev = w.crit;
     const status = !w.monitored
       ? 'no health reported'
@@ -1312,6 +1218,10 @@ export class HexGrid extends VizBase implements MonitorTarget {
     f[0] = lit[0];
     f[1] = lit[1];
     f[2] = lit[2];
+    const d = w.dimRGBA;
+    d[0] = lit[0] * BACKDROP_DIM;
+    d[1] = lit[1] * BACKDROP_DIM;
+    d[2] = lit[2] * BACKDROP_DIM;
   }
 
   /** Fill array for a workload's layer-0 body: the workload's persistent
@@ -1726,102 +1636,171 @@ export class HexGrid extends VizBase implements MonitorTarget {
   }
 
   /**
-   * Fill the tile rect with the layer-L honeycomb: pointy-top hexes of world
-   * radius worldHexRadius / LAYER_SUBDIV^L, aligned to the layer-0 honeycomb.
-   * Each cell inherits the criticality colour of the workload beneath it (plus
-   * a deterministic per-cell jitter). Cells outside every workload are skipped,
-   * so a workload's own area reads as "filled" while the gaps between workloads
-   * stay empty — preserving the overall honeycomb shape at every depth.
+   * Metric layer: draw one hexagon per metric for every resource overlapping
+   * the tile. The cells are a hex spiral centred on the resource, scaled so the
+   * whole spiral fits the area the resource occupies at layer 0 — so a resource
+   * with three metrics shows three large cells and one with ten shows ten small
+   * ones. The count is the data's, never padded to fill the hexagon.
    */
-  private buildSubLayer(
-    layer: number,
+  private buildMetricLayer(
     ox: number,
     oy: number,
     x1: number,
     y1: number,
+    scale: number,
     out: TileElement[],
   ): void {
-    const cellR = this.worldHexRadius / Math.pow(LAYER_SUBDIV, layer);
-    // Axial index range (pointy-top) covering the tile rect, relative to the
-    // honeycomb centre at world (0.5, 0.5). The q span is widened by the r span
-    // to absorb the axial shear.
-    const invRow = 1 / (1.5 * cellR);
-    const invCol = 1 / (SQRT3 * cellR);
-    const rMin = Math.floor((oy - 0.5) * invRow) - 1;
-    const rMax = Math.ceil((y1 - 0.5) * invRow) + 1;
-    const qMin = Math.floor((ox - 0.5) * invCol - rMax / 2) - 1;
-    const qMax = Math.ceil((x1 - 0.5) * invCol - rMin / 2) + 1;
+    const category = this.colorMode === 'category';
+    const G = this.gridN;
+    const r = this.worldHexRadius;
+    const cl = (v: number): number => (v < 0 ? 0 : v >= G ? G - 1 : v);
+    const gx0 = cl(Math.floor((ox - r) * G));
+    const gx1 = cl(Math.floor((x1 + r) * G));
+    const gy0 = cl(Math.floor((oy - r) * G));
+    const gy1 = cl(Math.floor((y1 + r) * G));
+    for (let gy = gy0; gy <= gy1; gy++) {
+      for (let gx = gx0; gx <= gx1; gx++) {
+        const bin = this.gridBins[gy * G + gx];
+        for (let bi = 0; bi < bin.length; bi++) {
+          const w = this.workloads[bin[bi]];
+          if (w.bbox.maxx <= ox || w.bbox.minx >= x1 || w.bbox.maxy <= oy || w.bbox.miny >= y1) continue;
+          this.drawMetrics(w, ox, oy, x1, y1, scale, category, out);
+        }
+      }
+    }
+  }
 
-    const fillR = cellR * SUB_FILL;
-    for (let r = rMin; r <= rMax; r++) {
-      for (let q = qMin; q <= qMax; q++) {
-        const wx = 0.5 + SQRT3 * cellR * (q + r / 2);
-        const wy = 0.5 + 1.5 * cellR * r;
-        if (wx < ox - cellR || wx > x1 + cellR || wy < oy - cellR || wy > y1 + cellR) continue;
-        const host = this.workloadAt(wx, wy);
-        if (!host) continue; // gap between workloads → leave empty
-        // Honour the layer-0 inter-workload gap at depth too. That gap is made
-        // by insetting each workload's merged outline (not by clearing cells),
-        // so a sub-cell can still map to a host inside the inset band. Skip any
-        // sub-cell whose centre lies outside the host's inset outline, so the
-        // deep-zoom fill keeps exactly the same silhouette — and the same gaps —
-        // as the layer-0 honeycomb.
-        if (!pointInRings(wx, wy, host.outline)) continue;
-        // Nest the gap across layers: also omit this fine cell if its centre
-        // falls in a COARSER sub-layer's inter-cell gap, so the honeycomb keeps
-        // visible gaps at every scale (self-similar) as you zoom deeper — the
-        // same gap treatment layer 0 gets, applied to each intermediate layer.
-        if (this.inNestedGap(wx, wy, layer)) continue;
+  private drawMetrics(
+    w: LiveWorkload,
+    ox: number,
+    oy: number,
+    x1: number,
+    y1: number,
+    scale: number,
+    category: boolean,
+    out: TileElement[],
+  ): void {    const cells = this.metricLayout(w);
+    if (cells.length === 0) return;
+    // The resource's own body, dimmed, sits under its metrics so it stays
+    // visible which cell they belong to and where one resource ends. Emitted
+    // only from the tile holding its centre: elements are not clipped to their
+    // tile, so a second copy would paint over metric cells already drawn by a
+    // neighbouring tile.
+    const cx = w.worldCenter[0];
+    const cy = w.worldCenter[1];
+    if (cx >= ox && cx < x1 && cy >= oy && cy < y1) this.drawBackdrop(w, category, out);
+    const labelPx = 2 * cells[0].r * METRIC_FILL * scale;
+    for (let i = 0; i < cells.length; i++) {
+      const c = cells[i];
+      if (c.x + c.r <= ox || c.x - c.r >= x1 || c.y + c.r <= oy || c.y - c.r >= y1) continue;
+      const res = w.resources[i];
+      const rad = c.r * METRIC_FILL;
+      let fill: RGBA;
+      if (category) {
+        fill = w.tint;
+      } else {
+        // Seed here too: onStep only recolours while this layer is on screen.
+        const base = this.critColor(res.current);
+        fill = res.fillRGBA;
+        fill[0] = base[0];
+        fill[1] = base[1];
+        fill[2] = base[2];
+      }
+      out.push({
+        type: 'shape',
+        shape: 'hexagon',
+        x: c.x,
+        y: c.y,
+        w: 2 * rad,
+        h: 2 * rad,
+        fill,
+        layer: 1,
+        depth: 0,
+      });
+      if (labelPx >= METRIC_LABEL_PX) {
         out.push({
-          type: 'shape',
-          shape: 'hexagon',
-          x: wx,
-          y: wy,
-          w: 2 * fillR,
-          h: 2 * fillR,
-          fill: this.subCellColor(host, q, r, layer),
-          layer: 1,
+          type: 'text',
+          x: c.x,
+          y: c.y,
+          size: 10,
+          text: res.id,
+          color: [0.98, 0.99, 1, 1],
+          align: 'center',
+          floating: true,
+          layer: 3,
           depth: 0,
         });
       }
     }
   }
 
-  /**
-   * True if (wx, wy) falls in the inter-cell gap of any sub-layer COARSER than
-   * `layer` (1 .. layer-1). Each coarser layer draws its cells at SUB_FILL of
-   * their radius, so the gap is everything outside the containing coarser
-   * cell's SUB_FILL core. Testing every coarser layer makes the honeycomb gaps
-   * nest self-similarly, so they stay visible at every zoom depth.
-   */
-  private inNestedGap(wx: number, wy: number, layer: number): boolean {
-    for (let k = 1; k < layer; k++) {
-      const kR = this.worldHexRadius / Math.pow(LAYER_SUBDIV, k);
-      const [kfq, kfr] = pixelToAxial(wx - 0.5, wy - 0.5, kR);
-      const [kq, kr] = hexRound(kfq, kfr);
-      const [kpx, kpy] = axialToPixel(kq, kr, kR);
-      if (!inHexCore(wx - 0.5 - kpx, wy - 0.5 - kpy, SUB_FILL * kR)) return true;
+  /** The resource's layer-0 silhouette, dimmed, drawn beneath its metrics. */
+  private drawBackdrop(w: LiveWorkload, category: boolean, out: TileElement[]): void {
+    let fill: RGBA;
+    if (category) {
+      fill = [w.tint[0] * BACKDROP_DIM, w.tint[1] * BACKDROP_DIM, w.tint[2] * BACKDROP_DIM, 1];
+    } else {
+      // Seed the shared array here, as layer 0 does, so a resource that has not
+      // tweened yet is still drawn in its real colour.
+      const base = this.critColor(w.crit);
+      fill = w.dimRGBA;
+      fill[0] = base[0] * BACKDROP_DIM;
+      fill[1] = base[1] * BACKDROP_DIM;
+      fill[2] = base[2] * BACKDROP_DIM;
     }
-    return false;
+    if (w.cells.length === 1) {
+      const rad = this.worldHexRadius * (1 - GAP_FRAC);
+      out.push({
+        type: 'shape',
+        shape: 'hexagon',
+        x: w.worldCenter[0],
+        y: w.worldCenter[1],
+        w: 2 * rad,
+        h: 2 * rad,
+        fill,
+        layer: 1,
+        depth: 0,
+      });
+    } else {
+      out.push({ type: 'vector', rings: w.outline, fill, layer: 1, depth: 0 });
+    }
   }
 
   /**
-   * Colour of a layer-L sub-cell: the host workload's severity, textured by a
-   * hash-picked resource and a small deterministic jitter so the fill reads as
-   * many distinct cells rather than a flat wash.
+   * Positions for a resource's metric cells, computed once. A spiral of `n`
+   * hexes spans `spiralRadiusFor(n)` rings, so sizing the sub-hex to
+   * fit / (rings·√3 + 1) puts the outermost cell exactly inside the area the
+   * resource covers at layer 0.
    */
-  private subCellColor(host: LiveWorkload, q: number, r: number, layer: number): RGBA {
-    const h = hashCell(q, r, layer);
-    if (this.colorMode === 'category') {
-      const j = ((h >>> 8) / 0xffffff - 0.5) * 0.1;
-      const t = host.tint;
-      return [clamp01(t[0] + j), clamp01(t[1] + j), clamp01(t[2] + j), 1];
+  private metricLayout(w: LiveWorkload): MetricCell[] {
+    if (w.metricCells) return w.metricCells;
+    const n = w.resources.length;
+    const cells: MetricCell[] = [];
+    if (n > 0) {
+      // Equal-area circle of the resource's cells, inset by the layer-0 gap.
+      const fit = this.worldHexRadius * (1 - GAP_FRAC) * 0.866 * Math.sqrt(w.cells.length);
+      const rings = spiralRadiusFor(n);
+      const subR = fit / (rings * Math.sqrt(3) + 1);
+      const spiral = hexSpiral(rings);
+      for (let i = 0; i < n; i++) {
+        const [dq, dr] = spiral[i];
+        const [dx, dy] = axialToPixel(dq, dr, subR);
+        cells.push({ x: w.worldCenter[0] + dx, y: w.worldCenter[1] + dy, r: subR });
+      }
     }
-    let sev = host.crit;
-    if (host.resources.length > 0) {
-      sev = sev * 0.45 + host.resources[h % host.resources.length].current * 0.55;
+    w.metricCells = cells;
+    return cells;
+  }
+
+  /** The metric cell under a world point, or -1. */
+  private metricAt(w: LiveWorkload, wx: number, wy: number): number {
+    const cells = this.metricLayout(w);
+    for (let i = 0; i < cells.length; i++) {
+      const c = cells[i];
+      const dx = wx - c.x;
+      const dy = wy - c.y;
+      if (dx * dx + dy * dy <= c.r * c.r) return i;
     }
-    const jitter = ((h >>> 8) / 0xffffff - 0.5) * 0.22;
-    return this.critColor(clamp01(sev + jitter));
+    return -1;
   }
 }
