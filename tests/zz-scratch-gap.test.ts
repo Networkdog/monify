@@ -64,6 +64,8 @@ function measure(strangerGap: number): void {
 
   let sameHub = 0;
   let crossHub = 0;
+  let sameHubIn = 0;
+  let crossHubIn = 0;
   for (const p of placed) {
     const mine = subOf.get(p.name);
     for (const [q, r] of p.cells) {
@@ -72,8 +74,14 @@ function measure(strangerGap: number): void {
         if (other === undefined) continue;
         const theirs = subOf.get(other);
         if (theirs === undefined || theirs === mine) continue;
-        if (hubOfSub.get(mine!) === hubOfSub.get(theirs)) sameHub++;
+        const hit = hubOfSub.get(mine!) === hubOfSub.get(theirs);
+        if (hit) sameHub++;
         else crossHub++;
+        // Same management group only: strips out the discrete flips of whether
+        // two giant MGs happen to abut, which swamp the global number.
+        if (mgOfSub.get(mine!) !== mgOfSub.get(theirs)) continue;
+        if (hit) sameHubIn++;
+        else crossHubIn++;
       }
     }
   }
@@ -114,14 +122,14 @@ function measure(strangerGap: number): void {
   console.log({
     strangerGap,
     ms,
-    cells,
     fill: fill.toFixed(3),
     wire: (dist / links).toFixed(2),
-    sameHubTouch: (sameHub / (sameHub + crossHub)).toFixed(3),
+    hubTouch: (sameHub / (sameHub + crossHub)).toFixed(3),
+    hubTouchInMg: (sameHubIn / (sameHubIn + crossHubIn)).toFixed(3),
     hubRatio: (same / sameN / (cross / crossN)).toFixed(3),
   });
 }
 
 it('stranger gap sweep', () => {
-  for (const g of [1, 1.5, 2.5, 4]) measure(g);
+  for (const g of [1, 1.2, 1.5, 1.8, 2.2, 2.5, 3]) measure(g);
 }, 900000);
